@@ -139,13 +139,17 @@ fn cmd_index(cwd: &Path, args: cli::IndexArgs) -> Result<()> {
         move |current: &str, p: &indexer::IndexProgress| {
             pb.set_length(p.total as u64);
             pb.set_position(p.processed as u64);
-            // Colored live stats line + the current file, both below the bar.
+            // Bottom line: the current file during the scan, or the active
+            // post-loop phase (e.g. "resolving references…") once the per-file
+            // scan is done — so the bar at N/N shows work rather than looking
+            // hung while edges are written.
+            let bottom = match p.phase {
+                Some(phase) => format!("\x1b[2m{phase}…\x1b[0m"),
+                None => format!("\x1b[2m{}\x1b[0m", truncate_middle(current, 64)),
+            };
             pb.set_message(format!(
-                "\x1b[36mfiles\x1b[0m {} \x1b[36msymbols\x1b[0m {} \x1b[36mprojects\x1b[0m {}\n  \x1b[2m{}\x1b[0m",
-                p.files_indexed,
-                p.symbols,
-                p.projects,
-                truncate_middle(current, 64),
+                "\x1b[36mfiles\x1b[0m {} \x1b[36msymbols\x1b[0m {} \x1b[36mprojects\x1b[0m {}\n  {}",
+                p.files_indexed, p.symbols, p.projects, bottom,
             ));
         }
     });

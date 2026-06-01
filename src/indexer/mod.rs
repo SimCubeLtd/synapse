@@ -64,6 +64,10 @@ pub struct IndexProgress {
     pub projects: usize,
     /// Packages discovered so far.
     pub packages: usize,
+    /// The current post-loop phase, when indexing has moved past the per-file
+    /// scan into edge resolution (e.g. "resolving references"). `None` during
+    /// the file scan. Lets the UI show what the otherwise-frozen bar is doing.
+    pub phase: Option<&'static str>,
 }
 
 /// A progress observer invoked once per candidate file as indexing proceeds.
@@ -148,6 +152,7 @@ pub fn index_repo(
                 symbols: outcome.symbols,
                 projects: projects_seen,
                 packages: 0,
+                phase: None,
             };
             cb(rel, &snap);
         }
@@ -235,32 +240,80 @@ pub fn index_repo(
         }
     }
 
+    // Post-loop edge-resolution passes. These run after the per-file scan (so
+    // their link targets all exist) and can be the bulk of wall-clock on large
+    // repos, so each reports a phase to the progress UI — otherwise the bar
+    // sits frozen at N/N and looks hung. `report_phase` reuses the same
+    // callback as the file scan, emitting a snapshot tagged with the phase.
+    // It's a fn (not a closure) taking the live counts so it doesn't hold a
+    // borrow of `outcome` across the mutations below.
+    let report_phase = |phase: &'static str, files: usize, symbols: usize| {
+        if let Some(cb) = progress {
+            cb(
+                "",
+                &IndexProgress {
+                    processed: total,
+                    total,
+                    files_indexed: files,
+                    symbols,
+                    projects: projects_seen,
+                    packages: 0,
+                    phase: Some(phase),
+                },
+            );
+        }
+    };
+
     // Resolve collected imports to known packages -> IMPORTS_PACKAGE edges.
     // Done after the main loop so every manifest has registered its packages.
     if !pending_imports.is_empty() {
+        report_phase("resolving imports", outcome.files_indexed, outcome.symbols);
         outcome.edges += resolve_imports(store, &pending_imports)?;
     }
 
     // Resolve supertype relationships -> INHERITS/IMPLEMENTS edges. Done after
     // the main loop so all symbols (the link targets) exist.
     if !pending_supertypes.is_empty() {
+        report_phase(
+            "resolving type relationships",
+            outcome.files_indexed,
+            outcome.symbols,
+        );
         outcome.edges += resolve_supertypes(store, &pending_supertypes)?;
     }
 
     // Resolve usage references -> REFERENCES edges. Done after the main loop so
     // all declarations (the link targets) exist — references are cross-file.
     if !pending_references.is_empty() {
+        report_phase(
+            "resolving references",
+            outcome.files_indexed,
+            outcome.symbols,
+        );
         outcome.edges += resolve_references(store, &pending_references)?;
     }
 
     // Associate every indexed file with its nearest owning project manifest,
     // creating CONTAINS_FILE edges. We link against the full candidate set (not
     // just files touched this run) so ownership is complete after any index.
-    for rel in &candidates {
-        if let Some(manifest) = owning_manifest(rel, &manifests) {
-            store.link_project_contains_file(&project_id(manifest), &file_id(rel))?;
-        }
-    }
+    // Batched into one transaction like the resolve passes above.
+    report_phase(
+        "linking project membership",
+        outcome.files_indexed,
+        outcome.symbols,
+    );
+    let contains_edges: Vec<crate::graph::model::GraphEdge> = candidates
+        .iter()
+        .filter_map(|rel| {
+            owning_manifest(rel, &manifests).map(|manifest| {
+                crate::graph::model::GraphEdge::ProjectContainsFile {
+                    project: project_id(manifest),
+                    file: file_id(rel),
+                }
+            })
+        })
+        .collect();
+    store.link_edges(&contains_edges)?;
 
     // Remove files that no longer exist as candidates (deleted/now-ignored).
     if !changed_only {
@@ -299,7 +352,7 @@ fn resolve_imports(
         .map(|p| p.name.as_str())
         .collect();
 
-    let mut edges = 0;
+    let mut batch: Vec<crate::graph::model::GraphEdge> = Vec::new();
     for (fid, imports, lang) in pending {
         // De-dup the resolved package ids per file.
         let mut linked: HashSet<String> = HashSet::new();
@@ -314,11 +367,15 @@ fn resolve_imports(
             if let Some(pkg_id) = resolved
                 && linked.insert(pkg_id.clone())
             {
-                store.link_file_imports_package(fid, &pkg_id)?;
-                edges += 1;
+                batch.push(crate::graph::model::GraphEdge::FileImportsPackage {
+                    file: fid.clone(),
+                    package: pkg_id,
+                });
             }
         }
     }
+    let edges = batch.len();
+    store.link_edges(&batch)?;
     Ok(edges)
 }
 
@@ -347,9 +404,9 @@ fn resolve_supertypes(
     store: &dyn GraphStore,
     pending: &[(String, Vec<tree_sitter::Supertype>)],
 ) -> Result<usize> {
-    use crate::graph::model::{SymbolKind, SymbolSearchQuery};
+    use crate::graph::model::{GraphEdge, SymbolKind, SymbolSearchQuery};
 
-    let mut edges = 0;
+    let mut batch: Vec<GraphEdge> = Vec::new();
     for (file, supers) in pending {
         let project_prefix = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         for st in supers {
@@ -405,15 +462,22 @@ fn resolve_supertypes(
                         matches!(target.kind, SymbolKind::Interface | SymbolKind::Trait)
                     }
                 };
-                if implements {
-                    store.link_symbol_implements(&child.id, &target.id)?;
+                batch.push(if implements {
+                    GraphEdge::SymbolImplements {
+                        from: child.id.clone(),
+                        to: target.id.clone(),
+                    }
                 } else {
-                    store.link_symbol_inherits(&child.id, &target.id)?;
-                }
-                edges += 1;
+                    GraphEdge::SymbolInherits {
+                        from: child.id.clone(),
+                        to: target.id.clone(),
+                    }
+                });
             }
         }
     }
+    let edges = batch.len();
+    store.link_edges(&batch)?;
     Ok(edges)
 }
 
@@ -445,7 +509,9 @@ fn resolve_references(
     // applied per reference below.
     let mut to_cache: HashMap<String, Vec<IndexedSymbol>> = HashMap::new();
 
-    let mut edges = 0;
+    // Accumulate edges and write them in one batch (one transaction) at the end
+    // rather than one DB statement per edge — this is what removes the stall.
+    let mut batch: Vec<crate::graph::model::GraphEdge> = Vec::new();
     for (file, refs) in pending {
         let project_prefix = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
 
@@ -522,11 +588,15 @@ fn resolve_references(
             // Deterministic order when an ambiguous name produces multiple edges.
             targets.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.id.cmp(&b.id)));
             for target in targets {
-                store.link_symbol_references(&from.id, &target.id)?;
-                edges += 1;
+                batch.push(crate::graph::model::GraphEdge::SymbolReferences {
+                    from: from.id.clone(),
+                    to: target.id.clone(),
+                });
             }
         }
     }
+    let edges = batch.len();
+    store.link_edges(&batch)?;
     Ok(edges)
 }
 

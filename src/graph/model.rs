@@ -248,6 +248,23 @@ pub struct RelatedItem {
     pub depth: usize,
 }
 
+/// A relationship edge to create between two already-upserted nodes, used by
+/// the indexer's post-pass to write many edges in one batch. Both ids must
+/// already exist as nodes; writing uses `MERGE` so re-runs are idempotent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphEdge {
+    /// `Symbol -[:REFERENCES]-> Symbol` (referrer -> referenced).
+    SymbolReferences { from: String, to: String },
+    /// `Symbol -[:INHERITS]-> Symbol` (subtype -> base).
+    SymbolInherits { from: String, to: String },
+    /// `Symbol -[:IMPLEMENTS]-> Symbol` (implementor -> interface/trait).
+    SymbolImplements { from: String, to: String },
+    /// `File -[:IMPORTS_PACKAGE]-> Package`.
+    FileImportsPackage { file: String, package: String },
+    /// `Project -[:CONTAINS_FILE]-> File`.
+    ProjectContainsFile { project: String, file: String },
+}
+
 /// Aggregate counts for `status`/`index --stats`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexStats {
