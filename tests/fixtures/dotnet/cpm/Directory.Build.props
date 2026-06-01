@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup>
+    <ManagedPackageVersionsCentrally>true</ManagedPackageVersionsCentrally>
+  </PropertyGroup>
+</Project>

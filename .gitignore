@@ -1,0 +1,11 @@
+# Rust build output
+/target
+
+# Synapse local workspace (graph, cache, generated packs)
+/.synapse
+
+# Generated context packs
+/context.md
+
+# Local Claude Code harness state
+/.claude

@@ -1,0 +1,9 @@
+{
+  "name": "synapse-portal",
+  "version": "1.0.0",
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022"
+  },
+  "include": ["src"]
+}

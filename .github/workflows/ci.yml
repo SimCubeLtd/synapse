@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # Clippy in both feature configurations (the in-memory store path and the
+      # production LadybugDB path). `-D warnings` keeps the tree lint-clean.
+      - name: Clippy (no default features)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: Clippy (ladybug)
+        run: cargo clippy --features ladybug --all-targets -- -D warnings
+
+      # Full suite includes the unit tests, CLI integration tests and the
+      # LadybugDB smoke test (compiles the C++ backend once, then caches).
+      - name: Test
+        run: cargo test --locked
