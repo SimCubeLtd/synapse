@@ -79,9 +79,9 @@ try `--tag dev` or a matching image tag.
 |---|---|
 | `init` | Create `.synapse/{synapse.toml,graph,cache,packs}` (`--force`, `--name`). |
 | `index` | Index the repo into LadybugDB (`--force`, `--changed`, `--stats`). Incremental via blake3 content hashes. |
-| `status` | Show index readiness, counts, stale + untracked files (`--json`, `--stale`). |
+| `status` | Show index readiness, counts (including `referenceEdges`), stale + untracked files (`--json`, `--stale`). The `--json` output lists `referenceLanguages` so reference-edge coverage is explicit. |
 | `symbols <query>` | Search symbols (`--kind`, `--file`, `--language`, `--json`). |
-| `related` | Find related files for a `--symbol` or `--file` (`--depth`, `--json`). Traverses the graph — project membership (`CONTAINS_FILE`) for same-project siblings, and type relations (`INHERITS`/`IMPLEMENTS`) for base types, interfaces/traits, subtypes and implementors — alongside same-directory / test / name heuristics. |
+| `related` | Find related files for a `--symbol` or `--file` (`--depth`, `--json`). Traverses the graph — project membership (`CONTAINS_FILE`) for same-project siblings, type relations (`INHERITS`/`IMPLEMENTS`) for base types, interfaces/traits, subtypes and implementors, and usage references (`REFERENCES`) for callers / instantiation sites — alongside same-directory / test / name heuristics. |
 | `packages` | List indexed package dependencies (or `--projects`), with versions resolved via .NET Central Package Management (`--ecosystem`, `--json`). Use `--importers <pkg>` for impact analysis: the files that import a package. |
 | `explore` | Launch [Ladybug Explorer](https://docs.ladybugdb.com/visualization/) (Docker) to visualize the indexed graph in a browser (`--port`, `--read-write`, `--detach`, `--in-memory`, `--tag`, `--print`). Mounts the index read-only by default; `--print` shows the `docker run` command without executing it. |
 | `pack` | Emit a context pack (`--changed`/`--path`/`--symbol`/`--query`, `--budget`, `--include-tests`, `--include-config`, `--include-diff`, `--dry-run`, `--explain`, `--output`). `--format markdown` (default) or `--format json` for programmatic callers. Writes to stdout unless `--output` is given; diagnostics go to stderr. |
@@ -119,6 +119,18 @@ symbols by name (preferring same-file/same-project matches). For C#, where the
 syntax doesn't separate a base class from interfaces, the edge kind is decided
 from the target symbol's kind. This is deterministic name-based resolution, not
 full type inference.
+
+**Usage references** (`REFERENCES`) connect the symbol a usage sits inside to the
+symbol it points at — `new Foo(...)` instantiations, calls, and type uses. So
+`related --symbol Foo` and `pack --symbol Foo` now surface the callers and
+instantiation sites of `Foo`, not just its declaration. Resolution is the same
+deterministic, name-based scheme as type relationships (same-file/same-project
+preference; ambiguous names link every candidate rather than guessing; a name
+that matches no declared symbol — e.g. a local variable — produces no edge).
+Reference extraction currently covers **C#, Rust, and JS/TS**; `status --json`
+reports `referenceLanguages` and a `referenceEdges` count so coverage is explicit
+rather than silently partial. (Python, Go and Svelte resolve type relationships
+and imports but not yet usage references.)
 
 **File → package imports** (`IMPORTS_PACKAGE`) are extracted for JS/TS (`import`/
 `require`, reduced to the npm package root) and C# (`using` namespace, matched to

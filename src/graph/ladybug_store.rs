@@ -341,6 +341,19 @@ impl GraphStore for LadybugGraphStore {
         )
     }
 
+    fn link_symbol_references(&self, from_symbol_id: &str, to_symbol_id: &str) -> Result<()> {
+        let _guard = self.lock.lock().unwrap();
+        let conn = self.conn()?;
+        self.exec(
+            &conn,
+            "MATCH (a:Symbol {id: $a}), (b:Symbol {id: $b}) MERGE (a)-[:REFERENCES]->(b)",
+            vec![
+                ("a", Value::String(from_symbol_id.to_string())),
+                ("b", Value::String(to_symbol_id.to_string())),
+            ],
+        )
+    }
+
     fn symbol_type_relations(&self, symbol_name: &str) -> Result<Vec<RelatedItem>> {
         let _guard = self.lock.lock().unwrap();
         let conn = self.conn()?;
@@ -384,6 +397,35 @@ impl GraphStore for LadybugGraphStore {
         }
         out.sort_by(|a, b| a.path.cmp(&b.path).then(a.reason.cmp(&b.reason)));
         out.dedup_by(|a, b| a.path == b.path && a.reason == b.reason);
+        Ok(out)
+    }
+
+    fn symbol_references(&self, symbol_name: &str) -> Result<Vec<RelatedItem>> {
+        let _guard = self.lock.lock().unwrap();
+        let conn = self.conn()?;
+        // Incoming REFERENCES edges = files that reference this symbol.
+        let cypher =
+            "MATCH (s:Symbol)-[:REFERENCES]->(t:Symbol {name: $n}) RETURN DISTINCT s.filePath";
+        let mut stmt = conn
+            .prepare(cypher)
+            .map_err(|e| anyhow!("preparing symbol_references: {e}"))?;
+        let result = conn
+            .execute(
+                &mut stmt,
+                vec![("n", Value::String(symbol_name.to_string()))],
+            )
+            .map_err(|e| anyhow!("executing symbol_references: {e}"))?;
+        let reason = format!("references {symbol_name}");
+        let mut out = Vec::new();
+        for row in result {
+            out.push(RelatedItem {
+                path: val_string(&row[0]),
+                reason: reason.clone(),
+                depth: 1,
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out.dedup_by(|a, b| a.path == b.path);
         Ok(out)
     }
 
@@ -514,23 +556,36 @@ impl GraphStore for LadybugGraphStore {
     }
 
     fn related_to_symbol(&self, symbol: &str, _depth: usize) -> Result<Vec<RelatedItem>> {
-        let _guard = self.lock.lock().unwrap();
-        let conn = self.conn()?;
-        let cypher =
-            "MATCH (s:Symbol {name: $name}) RETURN DISTINCT s.filePath ORDER BY s.filePath";
-        let mut stmt = conn
-            .prepare(cypher)
-            .map_err(|e| anyhow!("preparing related query: {e}"))?;
-        let result = conn
-            .execute(&mut stmt, vec![("name", Value::String(symbol.to_string()))])
-            .map_err(|e| anyhow!("executing related query: {e}"))?;
+        // Declaring files (depth 0) plus files that reference the symbol via
+        // incoming REFERENCES edges (depth 1 = callers/instantiation sites).
+        // The reference traversal is what lets `pack`/`related` surface usages;
+        // without it the graph edges would be populated but invisible.
         let mut out = Vec::new();
-        for row in result {
-            out.push(RelatedItem {
-                path: val_string(&row[0]),
-                reason: "exact symbol declaration".to_string(),
-                depth: 0,
-            });
+        {
+            let _guard = self.lock.lock().unwrap();
+            let conn = self.conn()?;
+            let cypher =
+                "MATCH (s:Symbol {name: $name}) RETURN DISTINCT s.filePath ORDER BY s.filePath";
+            let mut stmt = conn
+                .prepare(cypher)
+                .map_err(|e| anyhow!("preparing related query: {e}"))?;
+            let result = conn
+                .execute(&mut stmt, vec![("name", Value::String(symbol.to_string()))])
+                .map_err(|e| anyhow!("executing related query: {e}"))?;
+            for row in result {
+                out.push(RelatedItem {
+                    path: val_string(&row[0]),
+                    reason: "exact symbol declaration".to_string(),
+                    depth: 0,
+                });
+            }
+        }
+        // symbol_references takes its own lock, so it is called outside the
+        // block above. Declaring files (depth 0) take precedence on dedup.
+        for item in self.symbol_references(symbol)? {
+            if !out.iter().any(|o| o.path == item.path) {
+                out.push(item);
+            }
         }
         Ok(out)
     }
@@ -577,6 +632,7 @@ impl GraphStore for LadybugGraphStore {
             projects: count("Project")?,
             packages: count("Package")?,
             edges: count_rel("REFERENCES_PROJECT")? + count_rel("USES_PACKAGE")?,
+            reference_edges: count_rel("REFERENCES")?,
         })
     }
 

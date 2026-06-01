@@ -257,4 +257,6 @@ pub struct IndexStats {
     pub packages: usize,
     /// project/package relationship edge count.
     pub edges: usize,
+    /// symbol→symbol `REFERENCES` edge count (usage/call/instantiation sites).
+    pub reference_edges: usize,
 }

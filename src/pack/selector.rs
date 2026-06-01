@@ -469,9 +469,33 @@ fn file_stem(path: &str) -> String {
     stem.to_ascii_lowercase()
 }
 
-/// De-duplicate related items by path (keeping the smallest depth), drop items
-/// deeper than the ceiling (except depth 0), restrict to indexed files, and
-/// sort by `(depth, path)`.
+/// Specificity of a relation reason — higher wins when two items for the same
+/// path share a depth. An explicit edge ("references", "inherits", an importer)
+/// is more informative than membership heuristics ("same project", "same
+/// directory"), so it must survive de-duplication. Without this, in a
+/// single-project repo every reference is also a same-project sibling and the
+/// generic reason would always mask the specific one.
+fn reason_specificity(reason: &str) -> u8 {
+    if reason.starts_with("declares") {
+        4
+    } else if reason.starts_with("references")
+        || reason.contains("inherits")
+        || reason.contains("implement")
+        || reason.contains("base type")
+        || reason.contains("subtype")
+    {
+        3
+    } else if reason.contains("test") || reason.starts_with("path contains") {
+        2
+    } else {
+        // "same project", "same directory", "config/registration", ...
+        1
+    }
+}
+
+/// De-duplicate related items by path (keeping the smallest depth, then the
+/// most specific reason), drop items deeper than the ceiling (except depth 0),
+/// restrict to indexed files, and sort by `(depth, path)`.
 fn finalize_related(
     items: Vec<RelatedItem>,
     depth: usize,
@@ -487,7 +511,13 @@ fn finalize_related(
             continue;
         }
         match best.get(&item.path) {
-            Some(existing) if existing.depth <= item.depth => {}
+            // Keep the existing entry only if it's strictly shallower, or at the
+            // same depth with an equal-or-higher specificity reason.
+            Some(existing)
+                if existing.depth < item.depth
+                    || (existing.depth == item.depth
+                        && reason_specificity(&existing.reason)
+                            >= reason_specificity(&item.reason)) => {}
             _ => {
                 best.insert(item.path.clone(), item);
             }

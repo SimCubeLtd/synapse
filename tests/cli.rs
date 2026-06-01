@@ -407,6 +407,96 @@ fn test_pack_json_format() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// End-to-end on the production (LadybugDB) backend: a `new Foo()` in a
+/// separate file from the declaration must appear in `pack --symbol Foo`'s
+/// selection, and `status --json` must report a non-zero `referenceEdges`.
+/// This is the user-visible payoff of the REFERENCES edges — without the graph
+/// traversal in `related_to_symbol`, the caller file would be invisible here.
+#[test]
+fn test_pack_symbol_includes_reference_sites() {
+    let dir = make_temp_dir("pack_refs");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    // Declaration and caller in different files (and different leaf dirs) so a
+    // match can only come from a REFERENCES edge, not directory-neighbour noise.
+    std::fs::create_dir_all(dir.join("src/model")).unwrap();
+    std::fs::create_dir_all(dir.join("src/handlers")).unwrap();
+    std::fs::write(
+        dir.join("src/model/widget.rs"),
+        "pub struct Widget; impl Widget { pub fn new() -> Widget { Widget } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/handlers/app.rs"),
+        "fn run() { let _w = crate::model::widget::Widget::new(); }\n",
+    )
+    .unwrap();
+    git_init(&dir);
+    run_ok(&dir, &["init", "--name", "r"]);
+    run_ok(&dir, &["index"]);
+
+    let out = stdout(&run_ok(
+        &dir,
+        &["pack", "--symbol", "Widget", "--format", "json", "--dry-run"],
+    ));
+    assert!(
+        out.contains("src/handlers/app.rs"),
+        "caller file must appear in pack selection via REFERENCES edge: {out}"
+    );
+    assert!(
+        out.contains("references Widget"),
+        "reference reason should be present: {out}"
+    );
+
+    // status --json exposes the new edge count, > 0 here.
+    let status = stdout(&run_ok(&dir, &["status", "--json"]));
+    assert!(status.contains("\"referenceEdges\""), "status has referenceEdges: {status}");
+    assert!(
+        status.contains("\"referenceLanguages\""),
+        "status names covered languages: {status}"
+    );
+    assert!(
+        !status.contains("\"referenceEdges\": 0"),
+        "referenceEdges should be non-zero after indexing a reference: {status}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression: in a single-project repo (or same directory) every reference is
+/// ALSO a same-project / same-directory sibling. The `related` de-duplication
+/// must keep the specific "references" reason rather than letting the generic
+/// membership reason mask it — otherwise reference sites are silently invisible
+/// even though the edges exist.
+#[test]
+fn test_related_reference_not_masked_by_same_project() {
+    let dir = make_temp_dir("ref_mask");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    // Declaration and caller in the SAME directory: the caller is a
+    // same-directory + same-project sibling AND a reference site.
+    std::fs::write(
+        dir.join("src/widget.rs"),
+        "pub struct Widget; impl Widget { pub fn new() -> Widget { Widget } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/app.rs"),
+        "fn run() { let _w = crate::widget::Widget::new(); }\n",
+    )
+    .unwrap();
+    git_init(&dir);
+    run_ok(&dir, &["init", "--name", "r"]);
+    run_ok(&dir, &["index"]);
+
+    let out = stdout(&run_ok(&dir, &["related", "--symbol", "Widget", "--json"]));
+    // The caller appears with the specific reference reason, not just "same ...".
+    assert!(
+        out.contains("references Widget"),
+        "reference reason must survive de-dup against same-project/same-dir: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_explore_print_command() {
     let dir = make_temp_dir("explore_print");
