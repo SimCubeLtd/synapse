@@ -52,15 +52,15 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # lbug links its static C++ archive with `+whole-archive`; the Xcode 15+
-      # linker treats the resulting duplicate symbols as a hard error, so on
-      # macOS we fall back to the classic linker (which warns instead). Other
-      # platforms use the default toolchain (gcc/clang/MSVC) unchanged.
-      - name: Set macOS linker flags
-        if: runner.os == 'macOS'
-        run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> "$GITHUB_ENV"
-
+      # Pin LBUG_VERSION so lbug's build script downloads the matching prebuilt
+      # static lib directly, instead of querying the (IP-rate-limited on CI)
+      # GitHub "latest release" API. A failed query makes lbug fall back to
+      # building from source, which on macOS produces colliding static archives
+      # that fail to link. Pinning the version makes the prebuilt download
+      # deterministic on every runner.
       - name: Build release binary
+        env:
+          LBUG_VERSION: "0.17.0"
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Determine version

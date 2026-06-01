@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pin so lbug downloads the matching prebuilt static lib directly instead of
+  # hitting the rate-limited GitHub "latest release" API (whose failure forces a
+  # from-source build). Keep in sync with the lbug version in Cargo.toml.
+  LBUG_VERSION: "0.17.0"
 
 jobs:
   check:
