@@ -128,3 +128,82 @@ fn ladybug_reference_edge_roundtrips() {
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::remove_file(&path);
 }
+
+/// The batched `link_edges` path (one transaction, prepared statements reused)
+/// writes the same edges as the per-edge `link_*` methods, across edge kinds.
+#[test]
+fn ladybug_link_edges_batch_roundtrips() {
+    use synapse::graph::model::GraphEdge;
+
+    let path = temp_db_path("batch");
+    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_file(&path);
+
+    let store = LadybugGraphStore::open(&path).expect("open");
+    store.initialize_schema().expect("schema");
+
+    let mk = |id: &str, name: &str, file: &str| IndexedSymbol {
+        id: id.into(),
+        name: name.into(),
+        full_name: name.into(),
+        kind: SymbolKind::Class,
+        language: Language::CSharp,
+        file_path: file.into(),
+        start_line: 1,
+        end_line: 2,
+        visibility: "public".into(),
+        exported: true,
+    };
+    store
+        .upsert_symbol(mk("sym:base.cs#class#Base#1", "Base", "base.cs"))
+        .unwrap();
+    store
+        .upsert_symbol(mk("sym:impl.cs#class#Impl#1", "Impl", "impl.cs"))
+        .unwrap();
+    store
+        .upsert_symbol(mk("sym:user.cs#class#User#1", "User", "user.cs"))
+        .unwrap();
+
+    // Two edge kinds written in one batch (one transaction).
+    store
+        .link_edges(&[
+            GraphEdge::SymbolInherits {
+                from: "sym:impl.cs#class#Impl#1".into(),
+                to: "sym:base.cs#class#Base#1".into(),
+            },
+            GraphEdge::SymbolReferences {
+                from: "sym:user.cs#class#User#1".into(),
+                to: "sym:base.cs#class#Base#1".into(),
+            },
+        ])
+        .expect("link_edges batch");
+
+    // Both edges are queryable, and re-running the batch is idempotent (MERGE).
+    assert_eq!(store.stats().unwrap().reference_edges, 1);
+    let refs = store.symbol_references("Base").unwrap();
+    assert!(
+        refs.iter().any(|r| r.path == "user.cs"),
+        "batched REFERENCES edge must be queryable: {refs:?}"
+    );
+    let rels = store.symbol_type_relations("Impl").unwrap();
+    assert!(
+        rels.iter().any(|r| r.reason.contains("inherits")),
+        "batched INHERITS edge must be queryable: {rels:?}"
+    );
+
+    // Idempotency: the same batch again must not double-count.
+    store
+        .link_edges(&[GraphEdge::SymbolReferences {
+            from: "sym:user.cs#class#User#1".into(),
+            to: "sym:base.cs#class#Base#1".into(),
+        }])
+        .expect("re-link");
+    assert_eq!(
+        store.stats().unwrap().reference_edges,
+        1,
+        "MERGE must keep the batch idempotent"
+    );
+
+    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_file(&path);
+}

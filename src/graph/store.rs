@@ -41,6 +41,33 @@ pub trait GraphStore {
     /// type use (the `REFERENCES` edge). Direction is referrer -> referenced.
     fn link_symbol_references(&self, from_symbol_id: &str, to_symbol_id: &str) -> Result<()>;
 
+    /// Create many relationship edges in a single batch. Backends that support
+    /// transactions should write the whole batch in one transaction with reused
+    /// prepared statements — far faster than one `link_*` call per edge during
+    /// the indexer's post-pass. Idempotent (`MERGE`); endpoints must already
+    /// exist as nodes. The default implementation falls back to per-edge writes.
+    fn link_edges(&self, edges: &[crate::graph::model::GraphEdge]) -> Result<()> {
+        use crate::graph::model::GraphEdge;
+        for e in edges {
+            match e {
+                GraphEdge::SymbolReferences { from, to } => {
+                    self.link_symbol_references(from, to)?
+                }
+                GraphEdge::SymbolInherits { from, to } => self.link_symbol_inherits(from, to)?,
+                GraphEdge::SymbolImplements { from, to } => {
+                    self.link_symbol_implements(from, to)?
+                }
+                GraphEdge::FileImportsPackage { file, package } => {
+                    self.link_file_imports_package(file, package)?
+                }
+                GraphEdge::ProjectContainsFile { project, file } => {
+                    self.link_project_contains_file(project, file)?
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn symbols_matching(&self, query: &SymbolSearchQuery) -> Result<Vec<IndexedSymbol>>;
     fn files_matching(&self, query: &FileSearchQuery) -> Result<Vec<IndexedFile>>;
     fn related_to_symbol(&self, symbol: &str, depth: usize) -> Result<Vec<RelatedItem>>;

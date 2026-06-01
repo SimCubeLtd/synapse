@@ -354,6 +354,92 @@ impl GraphStore for LadybugGraphStore {
         )
     }
 
+    fn link_edges(&self, edges: &[crate::graph::model::GraphEdge]) -> Result<()> {
+        use crate::graph::model::GraphEdge;
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock.lock().unwrap();
+        let conn = self.conn()?;
+
+        // The Cypher for each edge kind. Same MERGE shape as the per-edge
+        // `link_*` methods; here the statement is prepared ONCE per kind and
+        // re-executed per row, all inside one transaction — so we pay a single
+        // commit instead of one per edge (the source of the end-of-index stall).
+        let cypher = |e: &GraphEdge| -> &'static str {
+            match e {
+                GraphEdge::SymbolReferences { .. } => {
+                    "MATCH (a:Symbol {id: $a}), (b:Symbol {id: $b}) MERGE (a)-[:REFERENCES]->(b)"
+                }
+                GraphEdge::SymbolInherits { .. } => {
+                    "MATCH (a:Symbol {id: $a}), (b:Symbol {id: $b}) MERGE (a)-[:INHERITS]->(b)"
+                }
+                GraphEdge::SymbolImplements { .. } => {
+                    "MATCH (a:Symbol {id: $a}), (b:Symbol {id: $b}) MERGE (a)-[:IMPLEMENTS]->(b)"
+                }
+                GraphEdge::FileImportsPackage { .. } => {
+                    "MATCH (f:File {id: $a}), (k:Package {id: $b}) MERGE (f)-[:IMPORTS_PACKAGE]->(k)"
+                }
+                GraphEdge::ProjectContainsFile { .. } => {
+                    "MATCH (p:Project {id: $a}), (f:File {id: $b}) MERGE (p)-[:CONTAINS_FILE]->(f)"
+                }
+            }
+        };
+        // The two endpoint ids for an edge, in (a, b) order matching the Cypher.
+        fn endpoints(e: &GraphEdge) -> (&str, &str) {
+            match e {
+                GraphEdge::SymbolReferences { from, to }
+                | GraphEdge::SymbolInherits { from, to }
+                | GraphEdge::SymbolImplements { from, to } => (from, to),
+                GraphEdge::FileImportsPackage { file, package } => (file, package),
+                GraphEdge::ProjectContainsFile { project, file } => (project, file),
+            }
+        }
+
+        // One prepared statement per distinct edge-kind Cypher, reused across
+        // all rows of that kind.
+        let mut prepared: std::collections::HashMap<&'static str, lbug::PreparedStatement> =
+            std::collections::HashMap::new();
+
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|e| anyhow!("begin transaction: {e}"))?;
+        // Run the batch; on any error, roll back so a partial batch isn't left
+        // half-committed, then surface the error.
+        let result = (|| -> Result<()> {
+            for edge in edges {
+                let q = cypher(edge);
+                if !prepared.contains_key(q) {
+                    let stmt = conn
+                        .prepare(q)
+                        .map_err(|e| anyhow!("preparing `{q}`: {e}"))?;
+                    prepared.insert(q, stmt);
+                }
+                let stmt = prepared.get_mut(q).expect("just inserted");
+                let (a, b) = endpoints(edge);
+                conn.execute(
+                    stmt,
+                    vec![
+                        ("a", Value::String(a.to_string())),
+                        ("b", Value::String(b.to_string())),
+                    ],
+                )
+                .map_err(|e| anyhow!("executing batch edge: {e}"))?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn
+                .query("COMMIT")
+                .map(|_| ())
+                .map_err(|e| anyhow!("commit transaction: {e}")),
+            Err(err) => {
+                // Best-effort rollback; report the original error.
+                let _ = conn.query("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
     fn symbol_type_relations(&self, symbol_name: &str) -> Result<Vec<RelatedItem>> {
         let _guard = self.lock.lock().unwrap();
         let conn = self.conn()?;
