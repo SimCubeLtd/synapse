@@ -436,7 +436,14 @@ fn test_pack_symbol_includes_reference_sites() {
 
     let out = stdout(&run_ok(
         &dir,
-        &["pack", "--symbol", "Widget", "--format", "json", "--dry-run"],
+        &[
+            "pack",
+            "--symbol",
+            "Widget",
+            "--format",
+            "json",
+            "--dry-run",
+        ],
     ));
     assert!(
         out.contains("src/handlers/app.rs"),
@@ -449,7 +456,10 @@ fn test_pack_symbol_includes_reference_sites() {
 
     // status --json exposes the new edge count, > 0 here.
     let status = stdout(&run_ok(&dir, &["status", "--json"]));
-    assert!(status.contains("\"referenceEdges\""), "status has referenceEdges: {status}");
+    assert!(
+        status.contains("\"referenceEdges\""),
+        "status has referenceEdges: {status}"
+    );
     assert!(
         status.contains("\"referenceLanguages\""),
         "status names covered languages: {status}"

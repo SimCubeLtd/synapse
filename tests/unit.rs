@@ -1000,7 +1000,11 @@ fn index_creates_reference_edges_csharp() {
     let tmp = std::env::temp_dir().join(format!("synapse-ref-cs-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    std::fs::write(tmp.join("Event.cs"), "namespace N { public record UserRegistered(int Id); }").unwrap();
+    std::fs::write(
+        tmp.join("Event.cs"),
+        "namespace N { public record UserRegistered(int Id); }",
+    )
+    .unwrap();
     std::fs::write(
         tmp.join("Handler.cs"),
         "namespace N { class Handler { void On() { var e = new UserRegistered(1); } } }",
@@ -1009,7 +1013,16 @@ fn index_creates_reference_edges_csharp() {
 
     let repo = Repo { root: tmp.clone() };
     let store = MemoryGraphStore::new();
-    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+    index_repo(
+        &repo,
+        &SynapseConfig::default(),
+        &store,
+        true,
+        false,
+        "2026-06-01T00:00:00+00:00",
+        None,
+    )
+    .unwrap();
 
     let refs = store.symbol_references("UserRegistered").unwrap();
     assert!(
@@ -1019,7 +1032,9 @@ fn index_creates_reference_edges_csharp() {
     // And it must surface through the consumer path that pack/related use.
     let related = store.related_to_symbol("UserRegistered", 1).unwrap();
     assert!(
-        related.iter().any(|r| r.path == "Handler.cs" && r.depth == 1),
+        related
+            .iter()
+            .any(|r| r.path == "Handler.cs" && r.depth == 1),
         "related_to_symbol must include the caller at depth 1: {related:?}"
     );
 
@@ -1035,12 +1050,25 @@ fn index_creates_reference_edges_rust() {
     let tmp = std::env::temp_dir().join(format!("synapse-ref-rs-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    std::fs::write(tmp.join("widget.rs"), "pub struct Widget; impl Widget { pub fn new() -> Widget { Widget } }").unwrap();
+    std::fs::write(
+        tmp.join("widget.rs"),
+        "pub struct Widget; impl Widget { pub fn new() -> Widget { Widget } }",
+    )
+    .unwrap();
     std::fs::write(tmp.join("app.rs"), "fn run() { let _w = Widget::new(); }").unwrap();
 
     let repo = Repo { root: tmp.clone() };
     let store = MemoryGraphStore::new();
-    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+    index_repo(
+        &repo,
+        &SynapseConfig::default(),
+        &store,
+        true,
+        false,
+        "2026-06-01T00:00:00+00:00",
+        None,
+    )
+    .unwrap();
 
     let refs = store.symbol_references("Widget").unwrap();
     assert!(
@@ -1061,11 +1089,24 @@ fn index_creates_reference_edges_ts() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(tmp.join("widget.ts"), "export class Widget {}").unwrap();
-    std::fs::write(tmp.join("app.ts"), "import { Widget } from './widget';\nfunction make() { return new Widget(); }").unwrap();
+    std::fs::write(
+        tmp.join("app.ts"),
+        "import { Widget } from './widget';\nfunction make() { return new Widget(); }",
+    )
+    .unwrap();
 
     let repo = Repo { root: tmp.clone() };
     let store = MemoryGraphStore::new();
-    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+    index_repo(
+        &repo,
+        &SynapseConfig::default(),
+        &store,
+        true,
+        false,
+        "2026-06-01T00:00:00+00:00",
+        None,
+    )
+    .unwrap();
 
     let refs = store.symbol_references("Widget").unwrap();
     assert!(
@@ -1100,7 +1141,16 @@ fn reference_ambiguous_name_links_all_candidates() {
 
     let repo = Repo { root: tmp.clone() };
     let store = MemoryGraphStore::new();
-    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+    index_repo(
+        &repo,
+        &SynapseConfig::default(),
+        &store,
+        true,
+        false,
+        "2026-06-01T00:00:00+00:00",
+        None,
+    )
+    .unwrap();
 
     let refs = store.symbol_references("Foo").unwrap();
     // Both declarations live in their own files; the caller references the name
@@ -1135,11 +1185,23 @@ fn reference_local_variable_creates_no_edge() {
 
     let repo = Repo { root: tmp.clone() };
     let store = MemoryGraphStore::new();
-    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+    index_repo(
+        &repo,
+        &SynapseConfig::default(),
+        &store,
+        true,
+        false,
+        "2026-06-01T00:00:00+00:00",
+        None,
+    )
+    .unwrap();
 
     // `total` is never declared as a symbol, so it must resolve to no edge.
     let refs = store.symbol_references("total").unwrap();
-    assert!(refs.is_empty(), "local `total` must not be a reference target: {refs:?}");
+    assert!(
+        refs.is_empty(),
+        "local `total` must not be a reference target: {refs:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -1217,4 +1279,3 @@ fn explore_docker_args_in_memory_skips_mount() {
     // READ_ONLY is unsupported with in-memory, so it must not be set.
     assert!(!joined.contains("READ_ONLY"));
 }
-
