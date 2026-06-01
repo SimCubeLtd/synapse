@@ -322,6 +322,16 @@ fn resolve_imports(
     Ok(edges)
 }
 
+/// Whether `candidate_path` lives in the same project directory as a file whose
+/// parent directory is `project_dir`. Segment-safe: `src` does not match
+/// `src2/foo` — the match must fall on a `/` boundary (or be the dir itself).
+fn same_project_dir(candidate_path: &str, project_dir: &str) -> bool {
+    !project_dir.is_empty()
+        && candidate_path
+            .strip_prefix(project_dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Resolve collected supertype relationships into `INHERITS`/`IMPLEMENTS` edges.
 /// Returns the number of edges created.
 ///
@@ -378,9 +388,7 @@ fn resolve_supertypes(
             } else {
                 let same_proj: Vec<_> = targets
                     .iter()
-                    .filter(|s| {
-                        !project_prefix.is_empty() && s.file_path.starts_with(project_prefix)
-                    })
+                    .filter(|s| same_project_dir(&s.file_path, project_prefix))
                     .cloned()
                     .collect();
                 if !same_proj.is_empty() {
@@ -427,36 +435,66 @@ fn resolve_references(
     store: &dyn GraphStore,
     pending: &[(String, Vec<tree_sitter::Reference>)],
 ) -> Result<usize> {
-    use crate::graph::model::SymbolSearchQuery;
+    use crate::graph::model::{IndexedSymbol, SymbolSearchQuery};
+    use std::collections::HashMap;
+
+    // Cache of target candidates keyed by referenced name, shared across every
+    // file — references to the same type recur constantly, so this turns an
+    // O(#refs) query pattern into O(#distinct names). Each entry holds the full
+    // exact-name candidate set (any file); same-file/same-project narrowing is
+    // applied per reference below.
+    let mut to_cache: HashMap<String, Vec<IndexedSymbol>> = HashMap::new();
 
     let mut edges = 0;
     for (file, refs) in pending {
         let project_prefix = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+
+        // Preload every declaration in this file once, indexed by name, for the
+        // `from` (enclosing-declaration) lookup — one query per file instead of
+        // one per reference. Candidates are sorted so selection is deterministic
+        // when a file has multiple same-named declarations (overloads, etc.).
+        let mut from_by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
+        let file_symbols = store.symbols_matching(&SymbolSearchQuery {
+            file: Some(file.clone()),
+            ..Default::default()
+        })?;
+        for sym in &file_symbols {
+            from_by_name.entry(sym.name.as_str()).or_default().push(sym);
+        }
+        for list in from_by_name.values_mut() {
+            list.sort_by(|a, b| {
+                a.start_line
+                    .cmp(&b.start_line)
+                    .then(a.end_line.cmp(&b.end_line))
+                    .then(a.id.cmp(&b.id))
+            });
+        }
+
         for r in refs {
             // The referring symbol must be a declaration in this file.
             if r.from.is_empty() {
                 continue;
             }
-            let from_candidates = store.symbols_matching(&SymbolSearchQuery {
-                name: Some(r.from.clone()),
-                file: Some(file.clone()),
-                ..Default::default()
-            })?;
-            let Some(from) = from_candidates.into_iter().find(|s| s.name == r.from) else {
+            let Some(from) = from_by_name.get(r.from.as_str()).and_then(|v| v.first()) else {
                 continue;
             };
 
-            // Candidate target symbols (exact name match, any file). An empty
-            // set means the name isn't a declared symbol (e.g. a local var) —
-            // no edge, which is the false-positive guard.
-            let mut targets: Vec<_> = store
-                .symbols_matching(&SymbolSearchQuery {
-                    name: Some(r.to.clone()),
-                    ..Default::default()
-                })?
-                .into_iter()
-                .filter(|s| s.name == r.to && s.id != from.id)
-                .collect();
+            // Candidate target symbols (exact name match, any file), cached
+            // across files. An empty set means the name isn't a declared symbol
+            // (e.g. a local var) — no edge, the false-positive guard.
+            if !to_cache.contains_key(&r.to) {
+                let candidates = store
+                    .symbols_matching(&SymbolSearchQuery {
+                        name: Some(r.to.clone()),
+                        ..Default::default()
+                    })?
+                    .into_iter()
+                    .filter(|s| s.name == r.to)
+                    .collect();
+                to_cache.insert(r.to.clone(), candidates);
+            }
+            let mut targets: Vec<&IndexedSymbol> =
+                to_cache[&r.to].iter().filter(|s| s.id != from.id).collect();
             if targets.is_empty() {
                 continue;
             }
@@ -466,25 +504,22 @@ fn resolve_references(
             let same_file: Vec<_> = targets
                 .iter()
                 .filter(|s| s.file_path == *file)
-                .cloned()
+                .copied()
                 .collect();
             if !same_file.is_empty() {
                 targets = same_file;
             } else {
                 let same_proj: Vec<_> = targets
                     .iter()
-                    .filter(|s| {
-                        !project_prefix.is_empty() && s.file_path.starts_with(project_prefix)
-                    })
-                    .cloned()
+                    .filter(|s| same_project_dir(&s.file_path, project_prefix))
+                    .copied()
                     .collect();
                 if !same_proj.is_empty() {
                     targets = same_proj;
                 }
             }
 
-            // Deterministic order when an ambiguous name produces multiple
-            // edges (sort by target file path).
+            // Deterministic order when an ambiguous name produces multiple edges.
             targets.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.id.cmp(&b.id)));
             for target in targets {
                 store.link_symbol_references(&from.id, &target.id)?;

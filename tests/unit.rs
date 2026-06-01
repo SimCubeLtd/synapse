@@ -1206,6 +1206,156 @@ fn reference_local_variable_creates_no_edge() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Store reference/relation lookups must be case-insensitive to match the
+/// case-insensitive seed: `symbol_references("widget")` must find usages of the
+/// declared `Widget`, otherwise `--symbol widget` would seed on the declaration
+/// but return no usages.
+#[test]
+fn reference_lookup_is_case_insensitive() {
+    use synapse::indexer::index_repo;
+    use synapse::repo::Repo;
+
+    let tmp = std::env::temp_dir().join(format!("synapse-ref-ci-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(
+        tmp.join("widget.rs"),
+        "pub struct Widget; impl Widget { pub fn new() -> Widget { Widget } }",
+    )
+    .unwrap();
+    std::fs::write(tmp.join("app.rs"), "fn run() { let _w = Widget::new(); }").unwrap();
+
+    let repo = Repo { root: tmp.clone() };
+    let store = MemoryGraphStore::new();
+    index_repo(
+        &repo,
+        &SynapseConfig::default(),
+        &store,
+        true,
+        false,
+        "2026-06-01T00:00:00+00:00",
+        None,
+    )
+    .unwrap();
+
+    // Lower-case query resolves to the PascalCase declaration's referrers.
+    let refs = store.symbol_references("widget").unwrap();
+    assert!(
+        refs.iter().any(|r| r.path == "app.rs"),
+        "case-insensitive lookup must find Widget references via `widget`: {refs:?}"
+    );
+    // related_to_symbol (the pack/related consumer path) too.
+    let related = store.related_to_symbol("WIDGET", 1).unwrap();
+    assert!(
+        related.iter().any(|r| r.path == "app.rs" && r.depth == 1),
+        "case-insensitive related_to_symbol must include the caller: {related:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Segment-safe same-project resolution: a declaration in `src2/` must NOT be
+/// treated as same-project for a referrer in `src/` just because "src" is a
+/// string prefix of "src2". With two ambiguous declarations (src/ and src2/),
+/// the src/ referrer must resolve to the src/ declaration only — proving the
+/// same-project filter fell on a path boundary, not a raw prefix.
+#[test]
+fn reference_same_project_is_segment_safe() {
+    use synapse::indexer::index_repo;
+    use synapse::repo::Repo;
+
+    let tmp = std::env::temp_dir().join(format!("synapse-ref-seg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("src")).unwrap();
+    std::fs::create_dir_all(tmp.join("src2")).unwrap();
+    // Same type name declared in both src/ and src2/.
+    std::fs::write(
+        tmp.join("src/Foo.cs"),
+        "namespace A { public class Foo {} }",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.join("src2/Foo.cs"),
+        "namespace B { public class Foo {} }",
+    )
+    .unwrap();
+    // Referrer in src/ (NOT src2/). project_prefix is "src"; "src2/Foo.cs"
+    // starts_with("src") but is a different directory.
+    std::fs::write(
+        tmp.join("src/User.cs"),
+        "namespace A { class User { void Go() { var x = new Foo(); } } }",
+    )
+    .unwrap();
+
+    let repo = Repo { root: tmp.clone() };
+    let store = MemoryGraphStore::new();
+    index_repo(
+        &repo,
+        &SynapseConfig::default(),
+        &store,
+        true,
+        false,
+        "2026-06-01T00:00:00+00:00",
+        None,
+    )
+    .unwrap();
+
+    // Exactly one edge: the src/ referrer resolves to the src/ Foo only. If the
+    // prefix check were unsafe, src2/Foo would also count as same-project and
+    // the same-project narrowing would behave differently.
+    let n = store.stats().unwrap().reference_edges;
+    assert_eq!(
+        n, 1,
+        "src/ referrer must link only the src/ Foo (segment-safe), got {n} edges"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Removing a file must prune reference edges that *point at* a symbol it
+/// declared, not just edges that originate from it — otherwise the
+/// `referenceEdges` stat is inflated by dangling edges.
+#[test]
+fn remove_file_prunes_incoming_reference_edges() {
+    use synapse::indexer::index_repo;
+    use synapse::repo::Repo;
+
+    let tmp = std::env::temp_dir().join(format!("synapse-ref-rm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    // Widget declared ONLY in widget.rs; app.rs references it cross-file.
+    std::fs::write(tmp.join("widget.rs"), "pub struct Widget;").unwrap();
+    std::fs::write(tmp.join("app.rs"), "fn run() -> Widget { Widget {} }").unwrap();
+    let repo = Repo { root: tmp.clone() };
+    let store = MemoryGraphStore::new();
+    index_repo(
+        &repo,
+        &SynapseConfig::default(),
+        &store,
+        true,
+        false,
+        "2026-06-01T00:00:00+00:00",
+        None,
+    )
+    .unwrap();
+    let before = store.stats().unwrap().reference_edges;
+    assert!(
+        before >= 1,
+        "expected at least one reference edge, got {before}"
+    );
+
+    // Removing the file that DECLARES Widget must prune the incoming edge from
+    // app.rs (whose `to` endpoint no longer exists), not leave it dangling.
+    store.remove_file("widget.rs").unwrap();
+    let after = store.stats().unwrap().reference_edges;
+    assert_eq!(
+        after, 0,
+        "incoming reference edges into removed widget.rs must be pruned: before={before} after={after}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn pack_format_parsing() {
     use synapse::pack::PackFormat;
