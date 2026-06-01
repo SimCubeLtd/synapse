@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::io::IsTerminal;
 use std::path::Path;
 use synapse::cli::{self, Cli, Command};
 use synapse::config::{self, SynapseConfig};
@@ -110,6 +111,49 @@ fn cmd_index(cwd: &Path, args: cli::IndexArgs) -> Result<()> {
     // Count candidates for the summary (walked-and-eligible files).
     let candidates = repo.candidate_files(&config)?;
     let now = now_rfc3339();
+
+    // Progress: a colored multi-line block (bar + live stats + current file),
+    // shown only on an interactive stderr and when not --quiet, so piped/CI/
+    // agent runs stay clean. `indicatif` draws to stderr and clears itself on
+    // completion, leaving the stdout summary untouched.
+    let show_progress = !args.quiet && std::io::stderr().is_terminal();
+    let bar = if show_progress {
+        let pb = indicatif::ProgressBar::new(candidates.len() as u64);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "{spinner:.green} indexing {bar:28.green/dim} {pos:>6}/{len:<6} \
+                 {elapsed:.dim} {msg}",
+            )
+            .unwrap()
+            .progress_chars("=> "),
+        );
+        // Redraw a few times a second so the spinner/ETA stay lively even when
+        // many files are skipped quickly.
+        pb.enable_steady_tick(std::time::Duration::from_millis(120));
+        Some(pb)
+    } else {
+        None
+    };
+
+    let progress = bar.as_ref().map(|pb| {
+        move |current: &str, p: &indexer::IndexProgress| {
+            pb.set_length(p.total as u64);
+            pb.set_position(p.processed as u64);
+            // Colored live stats line + the current file, both below the bar.
+            pb.set_message(format!(
+                "\x1b[36mfiles\x1b[0m {} \x1b[36msymbols\x1b[0m {} \x1b[36mprojects\x1b[0m {}\n  \x1b[2m{}\x1b[0m",
+                p.files_indexed,
+                p.symbols,
+                p.projects,
+                truncate_middle(current, 64),
+            ));
+        }
+    });
+    let progress_ref: Option<&indexer::ProgressFn<'_>> = match &progress {
+        Some(f) => Some(f),
+        None => None,
+    };
+
     let outcome = indexer::index_repo(
         &repo,
         &config,
@@ -117,7 +161,11 @@ fn cmd_index(cwd: &Path, args: cli::IndexArgs) -> Result<()> {
         args.force,
         args.changed,
         &now,
+        progress_ref,
     )?;
+    if let Some(pb) = &bar {
+        pb.finish_and_clear();
+    }
     let stats = store.stats()?;
 
     println!("Indexed {} files", fmt_num(outcome.files_indexed));
@@ -579,4 +627,23 @@ fn fmt_num(n: usize) -> String {
         out.push(*b as char);
     }
     out
+}
+
+/// Shorten `s` to at most `max` chars, eliding the middle with `…` so both the
+/// leading directory and the file name stay visible. Operates on chars to stay
+/// UTF-8 safe.
+fn truncate_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let keep = max - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let head_s: String = chars[..head].iter().collect();
+    let tail_s: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head_s}…{tail_s}")
 }

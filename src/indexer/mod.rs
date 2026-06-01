@@ -49,10 +49,35 @@ pub fn package_id(ecosystem: &str, name: &str) -> String {
     format!("pkg:{ecosystem}:{name}")
 }
 
+/// A live snapshot of indexing progress, passed to the [`ProgressFn`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexProgress {
+    /// Files visited so far (1-based as indexing proceeds).
+    pub processed: usize,
+    /// Total candidate files.
+    pub total: usize,
+    /// Files (re)indexed so far this run.
+    pub files_indexed: usize,
+    /// Symbols extracted so far.
+    pub symbols: usize,
+    /// Projects discovered so far (from manifests parsed up to this point).
+    pub projects: usize,
+    /// Packages discovered so far.
+    pub packages: usize,
+}
+
+/// A progress observer invoked once per candidate file as indexing proceeds.
+///
+/// Receives the current file path and a live [`IndexProgress`] snapshot. Kept as
+/// a plain callback so the indexer stays UI-agnostic — the binary wires this to
+/// a progress bar; tests can ignore it.
+pub type ProgressFn<'a> = dyn Fn(&str, &IndexProgress) + 'a;
+
 /// Index the repository into `store`.
 ///
 /// * `force` re-indexes every file regardless of hash.
 /// * `changed_only` restricts to files git reports as changed.
+/// * `progress` is invoked per file when `Some` (for a CLI progress bar).
 pub fn index_repo(
     repo: &Repo,
     config: &SynapseConfig,
@@ -60,6 +85,7 @@ pub fn index_repo(
     force: bool,
     changed_only: bool,
     now: &str,
+    progress: Option<&ProgressFn<'_>>,
 ) -> Result<IndexOutcome> {
     store.initialize_schema()?;
 
@@ -104,7 +130,24 @@ pub fn index_repo(
     // edges in a second pass once every symbol exists.
     let mut pending_supertypes: Vec<(String, Vec<tree_sitter::Supertype>)> = Vec::new();
 
-    for rel in &candidates {
+    // Live tally for the progress display (projects aren't in `outcome`, which
+    // only tracks files/symbols/edges). Package counts need post-pass dedup, so
+    // they're shown in the final summary rather than live.
+    let mut projects_seen = 0usize;
+
+    let total = candidates.len();
+    for (i, rel) in candidates.iter().enumerate() {
+        if let Some(cb) = progress {
+            let snap = IndexProgress {
+                processed: i + 1,
+                total,
+                files_indexed: outcome.files_indexed,
+                symbols: outcome.symbols,
+                projects: projects_seen,
+                packages: 0,
+            };
+            cb(rel, &snap);
+        }
         if changed_only && !changed.contains(rel) {
             // Skip files git didn't flag as changed.
             outcome.files_skipped_unchanged += 1;
@@ -176,8 +219,10 @@ pub fn index_repo(
         // Manifest parsing -> projects/packages/edges.
         if rel.ends_with(".csproj") {
             outcome.edges += index_csproj(rel, &abs, store, &central)?;
+            projects_seen += 1;
         } else if rel.ends_with("package.json") {
             outcome.edges += index_package_json(rel, &abs, store)?;
+            projects_seen += 1;
         }
     }
 

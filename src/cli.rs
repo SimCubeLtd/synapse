@@ -54,6 +54,9 @@ pub struct IndexArgs {
     /// Print detailed statistics after indexing.
     #[arg(long)]
     pub stats: bool,
+    /// Suppress the progress bar (also auto-disabled when stderr isn't a TTY).
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 #[derive(Debug, clap::Args)]

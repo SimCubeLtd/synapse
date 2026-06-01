@@ -674,6 +674,7 @@ fn index_resolves_cpm_versions_end_to_end() {
         true,
         false,
         "2026-06-01T00:00:00+00:00",
+        None,
     )
     .unwrap();
 
@@ -806,6 +807,7 @@ fn index_creates_imports_package_edges() {
         true,
         false,
         "2026-06-01T00:00:00+00:00",
+        None,
     )
     .unwrap();
 
@@ -904,6 +906,7 @@ fn index_creates_inherits_and_implements_edges() {
         true,
         false,
         "2026-06-01T00:00:00+00:00",
+        None,
     )
     .unwrap();
 
