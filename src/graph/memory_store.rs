@@ -26,6 +26,7 @@ struct Inner {
     file_pkgs: BTreeSet<(String, String)>,
     sym_inherits: BTreeSet<(String, String)>,
     sym_implements: BTreeSet<(String, String)>,
+    sym_references: BTreeSet<(String, String)>,
 }
 
 /// Simple, thread-safe, fully-functional in-memory store.
@@ -76,6 +77,8 @@ impl GraphStore for MemoryGraphStore {
         g.sym_inherits
             .retain(|(from, _)| !from.starts_with(&sym_prefix));
         g.sym_implements
+            .retain(|(from, _)| !from.starts_with(&sym_prefix));
+        g.sym_references
             .retain(|(from, _)| !from.starts_with(&sym_prefix));
         Ok(())
     }
@@ -151,6 +154,40 @@ impl GraphStore for MemoryGraphStore {
         g.sym_implements
             .insert((from_symbol_id.to_string(), to_symbol_id.to_string()));
         Ok(())
+    }
+
+    fn link_symbol_references(&self, from_symbol_id: &str, to_symbol_id: &str) -> Result<()> {
+        let mut g = self.inner.lock().unwrap();
+        g.sym_references
+            .insert((from_symbol_id.to_string(), to_symbol_id.to_string()));
+        Ok(())
+    }
+
+    fn symbol_references(&self, symbol_name: &str) -> Result<Vec<RelatedItem>> {
+        let g = self.inner.lock().unwrap();
+        // Symbol ids declaring this name (the reference targets).
+        let ids: BTreeSet<&str> = g
+            .symbols
+            .values()
+            .filter(|s| s.name == symbol_name)
+            .map(|s| s.id.as_str())
+            .collect();
+        let reason = format!("references {symbol_name}");
+        let mut out: Vec<RelatedItem> = Vec::new();
+        for (from, to) in &g.sym_references {
+            if ids.contains(to.as_str())
+                && let Some(s) = g.symbols.get(from)
+            {
+                out.push(RelatedItem {
+                    path: s.file_path.clone(),
+                    reason: reason.clone(),
+                    depth: 1,
+                });
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out.dedup_by(|a, b| a.path == b.path);
+        Ok(out)
     }
 
     fn symbol_type_relations(&self, symbol_name: &str) -> Result<Vec<RelatedItem>> {
@@ -257,8 +294,10 @@ impl GraphStore for MemoryGraphStore {
         let g = self.inner.lock().unwrap();
         let mut out = Vec::new();
         // Files declaring an exactly-named symbol are depth 0.
+        let mut target_ids: BTreeSet<&str> = BTreeSet::new();
         for s in g.symbols.values() {
             if s.name == symbol {
+                target_ids.insert(s.id.as_str());
                 out.push(RelatedItem {
                     path: s.file_path.clone(),
                     reason: "exact symbol declaration".to_string(),
@@ -266,7 +305,25 @@ impl GraphStore for MemoryGraphStore {
                 });
             }
         }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
+        // Files that reference the symbol via incoming REFERENCES edges are
+        // depth 1 (callers/instantiation sites). This traversal is what makes
+        // usages visible to `pack`/`related`. Mirror the lock-free inline form
+        // of `symbol_references` to avoid re-locking the mutex.
+        let reason = format!("references {symbol}");
+        for (from, to) in &g.sym_references {
+            if target_ids.contains(to.as_str())
+                && let Some(s) = g.symbols.get(from)
+            {
+                out.push(RelatedItem {
+                    path: s.file_path.clone(),
+                    reason: reason.clone(),
+                    depth: 1,
+                });
+            }
+        }
+        // Deterministic; declaration (depth 0) wins over reference (depth 1)
+        // when the same file both declares and references the symbol.
+        out.sort_by(|a, b| a.path.cmp(&b.path).then(a.depth.cmp(&b.depth)));
         out.dedup_by(|a, b| a.path == b.path);
         Ok(out)
     }
@@ -302,6 +359,7 @@ impl GraphStore for MemoryGraphStore {
             projects: g.projects.len(),
             packages: g.packages.len(),
             edges: g.project_refs.len() + g.project_pkgs.len(),
+            reference_edges: g.sym_references.len(),
         })
     }
 

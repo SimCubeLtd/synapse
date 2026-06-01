@@ -37,6 +37,9 @@ pub trait GraphStore {
     fn link_symbol_inherits(&self, from_symbol_id: &str, to_symbol_id: &str) -> Result<()>;
     /// Record that a symbol implements an interface/trait (the `IMPLEMENTS` edge).
     fn link_symbol_implements(&self, from_symbol_id: &str, to_symbol_id: &str) -> Result<()>;
+    /// Record that one symbol references another — an instantiation, call, or
+    /// type use (the `REFERENCES` edge). Direction is referrer -> referenced.
+    fn link_symbol_references(&self, from_symbol_id: &str, to_symbol_id: &str) -> Result<()>;
 
     fn symbols_matching(&self, query: &SymbolSearchQuery) -> Result<Vec<IndexedSymbol>>;
     fn files_matching(&self, query: &FileSearchQuery) -> Result<Vec<IndexedFile>>;
@@ -69,6 +72,12 @@ pub trait GraphStore {
     /// implementors. Each item's reason names the relationship. Used by
     /// `related`. Deterministic order; empty when the symbol has no such edges.
     fn symbol_type_relations(&self, symbol_name: &str) -> Result<Vec<RelatedItem>>;
+
+    /// Files that reference the named symbol via incoming `REFERENCES` edges
+    /// (the symbol's callers / instantiation sites). Each item's reason names
+    /// the relationship. Used by `related`/`pack`. Deterministic order; empty
+    /// when nothing references the symbol.
+    fn symbol_references(&self, symbol_name: &str) -> Result<Vec<RelatedItem>>;
 
     /// Files that belong to the same project(s) as `path`, traversing the
     /// `CONTAINS_FILE` edges (project -> file). Excludes `path` itself. Each

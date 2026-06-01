@@ -932,6 +932,219 @@ fn index_creates_inherits_and_implements_edges() {
 }
 
 #[test]
+fn extract_references_per_language() {
+    use synapse::indexer::tree_sitter::extract_references;
+
+    // C#: `new Foo(...)` inside a method -> Handle references Foo.
+    let cs = "namespace N { record Foo(int X); class H { void Handle() { var f = new Foo(1); } } }";
+    let csr = extract_references("a.cs", Language::CSharp, cs);
+    assert!(
+        csr.iter().any(|r| r.from == "Handle" && r.to == "Foo"),
+        "C# `new Foo()` should reference Foo from Handle: {csr:?}"
+    );
+
+    // Rust: `Foo::new()` inside a function -> run references Foo (the type
+    // segment) and/or new. The type segment Foo is what resolves to a decl.
+    let rs = "struct Foo; impl Foo { fn new() -> Foo { Foo } } fn run() { let _ = Foo::new(); }";
+    let rsr = extract_references("a.rs", Language::Rust, rs);
+    assert!(
+        rsr.iter().any(|r| r.from == "run" && r.to == "Foo"),
+        "Rust `Foo::new()` should reference Foo from run: {rsr:?}"
+    );
+
+    // TS: `new Foo()` inside a function -> make references Foo.
+    let ts = "class Foo {} function make() { return new Foo(); }";
+    let tsr = extract_references("a.ts", Language::TypeScript, ts);
+    assert!(
+        tsr.iter().any(|r| r.from == "make" && r.to == "Foo"),
+        "TS `new Foo()` should reference Foo from make: {tsr:?}"
+    );
+
+    // C#: type used only in a generic position (`Ok<Foo>`) must be captured —
+    // this is the common "type referenced but never `new`-ed" case that drove
+    // adding type-position coverage. Also covers a parameter type.
+    let cs2 = "class H { Result<Foo> Handle(Bar b) { return default; } }";
+    let cs2r = extract_references("b.cs", Language::CSharp, cs2);
+    assert!(
+        cs2r.iter().any(|r| r.from == "Handle" && r.to == "Foo"),
+        "C# generic arg `Result<Foo>` should reference Foo: {cs2r:?}"
+    );
+    assert!(
+        cs2r.iter().any(|r| r.from == "Handle" && r.to == "Bar"),
+        "C# parameter type `Bar b` should reference Bar: {cs2r:?}"
+    );
+
+    // C#: property and field types — common "used as a member type but never
+    // instantiated" case. Enclosing declaration is the containing class.
+    let cs3 = "class State { public Employee Emp { get; set; } private Ledger _l; }";
+    let cs3r = extract_references("c.cs", Language::CSharp, cs3);
+    assert!(
+        cs3r.iter().any(|r| r.from == "State" && r.to == "Employee"),
+        "C# property type `Employee Emp` should reference Employee: {cs3r:?}"
+    );
+    assert!(
+        cs3r.iter().any(|r| r.from == "State" && r.to == "Ledger"),
+        "C# field type `Ledger _l` should reference Ledger: {cs3r:?}"
+    );
+}
+
+/// The core impact-analysis case: a C# `new Foo(...)` in another file must
+/// produce a REFERENCES edge so `pack`/`related` can surface the caller. This
+/// is the exact behaviour that was silently absent before (the `UserRegistered`
+/// undercount), so the edge MUST flow through to `related_to_symbol`.
+#[test]
+fn index_creates_reference_edges_csharp() {
+    use synapse::indexer::index_repo;
+    use synapse::repo::Repo;
+
+    let tmp = std::env::temp_dir().join(format!("synapse-ref-cs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("Event.cs"), "namespace N { public record UserRegistered(int Id); }").unwrap();
+    std::fs::write(
+        tmp.join("Handler.cs"),
+        "namespace N { class Handler { void On() { var e = new UserRegistered(1); } } }",
+    )
+    .unwrap();
+
+    let repo = Repo { root: tmp.clone() };
+    let store = MemoryGraphStore::new();
+    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+
+    let refs = store.symbol_references("UserRegistered").unwrap();
+    assert!(
+        refs.iter().any(|r| r.path == "Handler.cs"),
+        "Handler.cs instantiates UserRegistered and must be a reference site: {refs:?}"
+    );
+    // And it must surface through the consumer path that pack/related use.
+    let related = store.related_to_symbol("UserRegistered", 1).unwrap();
+    assert!(
+        related.iter().any(|r| r.path == "Handler.cs" && r.depth == 1),
+        "related_to_symbol must include the caller at depth 1: {related:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Rust `Foo::new()` across files produces a reference edge to the type.
+#[test]
+fn index_creates_reference_edges_rust() {
+    use synapse::indexer::index_repo;
+    use synapse::repo::Repo;
+
+    let tmp = std::env::temp_dir().join(format!("synapse-ref-rs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("widget.rs"), "pub struct Widget; impl Widget { pub fn new() -> Widget { Widget } }").unwrap();
+    std::fs::write(tmp.join("app.rs"), "fn run() { let _w = Widget::new(); }").unwrap();
+
+    let repo = Repo { root: tmp.clone() };
+    let store = MemoryGraphStore::new();
+    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+
+    let refs = store.symbol_references("Widget").unwrap();
+    assert!(
+        refs.iter().any(|r| r.path == "app.rs"),
+        "app.rs calls Widget::new() and must reference Widget: {refs:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// TS `new Foo()` across files produces a reference edge.
+#[test]
+fn index_creates_reference_edges_ts() {
+    use synapse::indexer::index_repo;
+    use synapse::repo::Repo;
+
+    let tmp = std::env::temp_dir().join(format!("synapse-ref-ts-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("widget.ts"), "export class Widget {}").unwrap();
+    std::fs::write(tmp.join("app.ts"), "import { Widget } from './widget';\nfunction make() { return new Widget(); }").unwrap();
+
+    let repo = Repo { root: tmp.clone() };
+    let store = MemoryGraphStore::new();
+    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+
+    let refs = store.symbol_references("Widget").unwrap();
+    assert!(
+        refs.iter().any(|r| r.path == "app.ts"),
+        "app.ts instantiates Widget and must reference it: {refs:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Ambiguity: the same type name declared in two files, referenced from a
+/// third, must produce an edge to BOTH declarations — we never silently pick
+/// one. (The referrer is in neither declaring directory, so the same-file /
+/// same-project preference doesn't collapse the candidates.)
+#[test]
+fn reference_ambiguous_name_links_all_candidates() {
+    use synapse::indexer::index_repo;
+    use synapse::repo::Repo;
+
+    let tmp = std::env::temp_dir().join(format!("synapse-ref-amb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("a")).unwrap();
+    std::fs::create_dir_all(tmp.join("b")).unwrap();
+    std::fs::create_dir_all(tmp.join("c")).unwrap();
+    std::fs::write(tmp.join("a/Foo.cs"), "namespace A { public class Foo {} }").unwrap();
+    std::fs::write(tmp.join("b/Foo.cs"), "namespace B { public class Foo {} }").unwrap();
+    std::fs::write(
+        tmp.join("c/User.cs"),
+        "namespace C { class User { void Go() { var x = new Foo(); } } }",
+    )
+    .unwrap();
+
+    let repo = Repo { root: tmp.clone() };
+    let store = MemoryGraphStore::new();
+    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+
+    let refs = store.symbol_references("Foo").unwrap();
+    // Both declarations live in their own files; the caller references the name
+    // ambiguously, so both decl files appear as reference *targets*. We assert
+    // the edge count by checking the reference came from the caller to a Foo in
+    // each directory — i.e. resolution did not silently drop one candidate.
+    // symbol_references returns referrer files; the referrer is c/User.cs for
+    // both edges, so we assert via the raw edge count through stats instead.
+    let n = store.stats().unwrap().reference_edges;
+    assert!(
+        n >= 2,
+        "ambiguous `new Foo()` should link both Foo declarations (>=2 edges), got {n}: {refs:?}"
+    );
+}
+
+/// False-positive guard: a local variable whose name matches no declared symbol
+/// must NOT create a reference edge. Here `total` is a local, not a type.
+#[test]
+fn reference_local_variable_creates_no_edge() {
+    use synapse::indexer::index_repo;
+    use synapse::repo::Repo;
+
+    let tmp = std::env::temp_dir().join(format!("synapse-ref-local-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    // `Compute()` calls `total()` which is not a declared symbol anywhere.
+    std::fs::write(
+        tmp.join("Calc.cs"),
+        "namespace N { class Calc { int Compute() { var total = 0; return total; } } }",
+    )
+    .unwrap();
+
+    let repo = Repo { root: tmp.clone() };
+    let store = MemoryGraphStore::new();
+    index_repo(&repo, &SynapseConfig::default(), &store, true, false, "2026-06-01T00:00:00+00:00", None).unwrap();
+
+    // `total` is never declared as a symbol, so it must resolve to no edge.
+    let refs = store.symbol_references("total").unwrap();
+    assert!(refs.is_empty(), "local `total` must not be a reference target: {refs:?}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn pack_format_parsing() {
     use synapse::pack::PackFormat;
     assert_eq!(PackFormat::from_str_opt("json"), Some(PackFormat::Json));
@@ -1004,3 +1217,4 @@ fn explore_docker_args_in_memory_skips_mount() {
     // READ_ONLY is unsupported with in-memory, so it must not be set.
     assert!(!joined.contains("READ_ONLY"));
 }
+

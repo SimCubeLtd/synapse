@@ -1433,3 +1433,280 @@ fn descendants_of_kind<'a>(root: Node<'a>, kind: &str) -> Vec<Node<'a>> {
     }
     found
 }
+
+// ---------------------------------------------------------------------------
+// Reference extraction: which declared symbol does a usage site point at, and
+// which declaration encloses that usage? Mirrors the supertype pipeline above
+// (extract -> pending list -> resolve in the indexer's second pass). Like
+// supertypes, this is name-based and best-effort; cross-file name resolution
+// and the false-positive guard for unmatched names happen in the resolve pass.
+// ---------------------------------------------------------------------------
+
+/// A "symbol X is referenced from inside declaration Y" relationship discovered
+/// syntactically. Both fields are bare identifiers; resolution to symbol ids
+/// (and dropping references whose target isn't a declared symbol) happens later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    /// Name of the enclosing declaration the usage appears inside (the smallest
+    /// declaration containing the usage). Empty if no enclosing declaration.
+    pub from: String,
+    /// Name of the referenced symbol (bare identifier, generics/qualifiers
+    /// stripped).
+    pub to: String,
+}
+
+/// Extract symbol→symbol reference relationships from a file.
+///
+/// Best-effort and name-based. Returns an empty list for languages without a
+/// reference extractor yet (Python, Go, Svelte — see `status`'s
+/// `referenceLanguages`).
+pub fn extract_references(path: &str, lang: Language, text: &str) -> Vec<Reference> {
+    let result = match lang {
+        Language::CSharp => csharp_references(text),
+        Language::Rust => rust_references(text),
+        Language::TypeScript | Language::JavaScript => ts_references(path, lang, text),
+        _ => Ok(Vec::new()),
+    };
+    let mut out = result.unwrap_or_else(|e| {
+        tracing::debug!("reference extraction failed for {path}: {e}");
+        Vec::new()
+    });
+    out.sort_by(|a, b| a.from.cmp(&b.from).then_with(|| a.to.cmp(&b.to)));
+    out.dedup();
+    out
+}
+
+/// Name of the nearest ancestor declaration of `node` whose kind is in
+/// `decl_kinds`, read from its `name` field. Empty when none is found (e.g. a
+/// top-level / module-scope usage).
+fn enclosing_decl_name(node: Node, src: &[u8], decl_kinds: &[&str]) -> String {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if decl_kinds.contains(&n.kind())
+            && let Some(name_node) = n.child_by_field_name("name")
+            && let Ok(name) = name_node.utf8_text(src)
+        {
+            return name.to_string();
+        }
+        cur = n.parent();
+    }
+    String::new()
+}
+
+/// C#: `new Foo(...)`, `Foo.Bar()` / `Bar()` invocations, generic type
+/// arguments (`List<Foo>`), parameter types (`void M(Foo f)`), and property /
+/// field types (`Foo Bar { get; }`, `Foo _bar;`). Enclosing declaration is the
+/// method/ctor/type the usage sits in.
+fn csharp_references(text: &str) -> Result<Vec<Reference>> {
+    const DECLS: &[&str] = &[
+        "method_declaration",
+        "constructor_declaration",
+        "class_declaration",
+        "record_declaration",
+        "struct_declaration",
+    ];
+    let lang: TsLanguage = tree_sitter_c_sharp::LANGUAGE.into();
+    let tree = parse(&lang, text)?;
+    let src = text.as_bytes();
+    let mut out = Vec::new();
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        // A node may contribute one referenced-type/method node.
+        let target: Option<Node> = match node.kind() {
+            // `new Foo(...)` / `new Foo { ... }` — the constructed type.
+            "object_creation_expression" => node.child_by_field_name("type"),
+            // `Foo()` or `recv.Foo()` — the invoked function/method.
+            "invocation_expression" => node.child_by_field_name("function"),
+            // `void M(Foo f)` — the parameter's declared type. The first child
+            // is the type, the rest the name/modifiers.
+            "parameter" => node.child_by_field_name("type"),
+            // `public Foo Bar { get; set; }` — the property's declared type.
+            "property_declaration" => node.child_by_field_name("type"),
+            // `private Foo bar;` — the field's type lives on the `type` field
+            // of its inner (unnamed) `variable_declaration` child. (Method-local
+            // `var x = ...` declarations are `local_declaration_statement`, so
+            // this only fires for class/struct/record fields.)
+            "field_declaration" => {
+                let mut c = node.walk();
+                node.children(&mut c)
+                    .find(|ch| ch.kind() == "variable_declaration")
+                    .and_then(|d| d.child_by_field_name("type"))
+            }
+            _ => None,
+        };
+        if let Some(t) = target
+            && let Ok(raw) = invocation_or_type_name(t, src)
+        {
+            let to = bare_type_name(&raw);
+            if !to.is_empty() {
+                out.push(Reference {
+                    from: enclosing_decl_name(node, src, DECLS),
+                    to,
+                });
+            }
+        }
+        // Generic type arguments: `List<Foo, Bar>` -> Foo, Bar. The argument
+        // list holds bare type nodes (identifier / qualified / generic). We
+        // can't use a `type` field here, so read each non-punctuation child.
+        if node.kind() == "type_argument_list" {
+            let from = enclosing_decl_name(node, src, DECLS);
+            let mut c = node.walk();
+            for arg in node.children(&mut c) {
+                if matches!(
+                    arg.kind(),
+                    "identifier" | "qualified_name" | "generic_name" | "type"
+                ) && let Ok(raw) = arg.utf8_text(src)
+                {
+                    let to = bare_type_name(raw);
+                    if !to.is_empty() {
+                        out.push(Reference {
+                            from: from.clone(),
+                            to,
+                        });
+                    }
+                }
+            }
+        }
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    Ok(out)
+}
+
+/// For an `invocation_expression`'s function child, return the rightmost name
+/// (`recv.Foo` -> `Foo`, `Foo` -> `Foo`). `bare_type_name` strips the receiver.
+fn invocation_or_type_name<'a>(node: Node<'a>, src: &'a [u8]) -> Result<String> {
+    node.utf8_text(src)
+        .map(|s| s.to_string())
+        .map_err(|e| anyhow!("utf8: {e}"))
+}
+
+/// Rust: `foo()` / `Foo::new()` calls and `Foo { .. }` struct literals. The
+/// resolve pass keeps only references whose target is a declared symbol, so the
+/// rightmost path segment is what matters (`Foo::new` -> `new`? no — we want
+/// the type, so for a scoped call we take the type segment, see below).
+fn rust_references(text: &str) -> Result<Vec<Reference>> {
+    const DECLS: &[&str] = &["function_item", "impl_item", "struct_item", "enum_item"];
+    let lang: TsLanguage = tree_sitter_rust::LANGUAGE.into();
+    let tree = parse(&lang, text)?;
+    let src = text.as_bytes();
+    let mut out = Vec::new();
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let mut targets: Vec<String> = Vec::new();
+        match node.kind() {
+            "call_expression" => {
+                if let Some(func) = node.child_by_field_name("function") {
+                    // `Foo::new()` -> the `Foo` type segment; `foo()` -> `foo`.
+                    targets.extend(rust_call_targets(func, src));
+                }
+            }
+            // `Foo { .. }` struct literal -> reference to `Foo`.
+            "struct_expression" => {
+                if let Some(name) = node.child_by_field_name("name")
+                    && let Ok(t) = name.utf8_text(src)
+                {
+                    targets.push(bare_type_name(t));
+                }
+            }
+            _ => {}
+        }
+        for to in targets {
+            if !to.is_empty() {
+                out.push(Reference {
+                    from: enclosing_decl_name(node, src, DECLS),
+                    to,
+                });
+            }
+        }
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    Ok(out)
+}
+
+/// Names a Rust call expression references. For `Foo::new` we emit both the
+/// type segment (`Foo`) and the function segment (`new`); the resolve pass
+/// drops whichever doesn't match a declared symbol. For a bare `foo` we emit
+/// `foo`. For `recv.method()` (field_expression) we emit the method name.
+fn rust_call_targets(func: Node, src: &[u8]) -> Vec<String> {
+    match func.kind() {
+        "identifier" => func
+            .utf8_text(src)
+            .ok()
+            .map(|t| vec![t.to_string()])
+            .unwrap_or_default(),
+        // `Foo::new` / `module::func`
+        "scoped_identifier" => {
+            let mut out = Vec::new();
+            if let Some(path) = func.child_by_field_name("path")
+                && let Ok(t) = path.utf8_text(src)
+            {
+                out.push(bare_type_name(t));
+            }
+            if let Some(name) = func.child_by_field_name("name")
+                && let Ok(t) = name.utf8_text(src)
+            {
+                out.push(t.to_string());
+            }
+            out
+        }
+        // `recv.method` — the method name is the field.
+        "field_expression" => func
+            .child_by_field_name("field")
+            .and_then(|f| f.utf8_text(src).ok())
+            .map(|t| vec![t.to_string()])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// TS/JS: `new Foo()`, `foo()` / `recv.foo()` calls, and `type_identifier`s in
+/// type positions. Enclosing declaration is the function/method/class.
+fn ts_references(path: &str, lang: Language, text: &str) -> Result<Vec<Reference>> {
+    const DECLS: &[&str] = &[
+        "function_declaration",
+        "method_definition",
+        "class_declaration",
+        "variable_declarator",
+    ];
+    let ts_lang = js_ts_language(path, lang);
+    let tree = parse(&ts_lang, text)?;
+    let src = text.as_bytes();
+    let mut out = Vec::new();
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let target: Option<Node> = match node.kind() {
+            // `new Foo(...)` — the constructed class.
+            "new_expression" => node.child_by_field_name("constructor"),
+            // `foo()` / `recv.foo()` — the called function.
+            "call_expression" => node.child_by_field_name("function"),
+            // `: Foo` / `<Foo>` type positions.
+            "type_identifier" => Some(node),
+            _ => None,
+        };
+        if let Some(t) = target
+            && let Ok(raw) = t.utf8_text(src)
+        {
+            let to = bare_type_name(raw);
+            if !to.is_empty() {
+                out.push(Reference {
+                    from: enclosing_decl_name(node, src, DECLS),
+                    to,
+                });
+            }
+        }
+        let mut c = node.walk();
+        for ch in node.children(&mut c) {
+            stack.push(ch);
+        }
+    }
+    Ok(out)
+}

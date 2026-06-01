@@ -252,6 +252,10 @@ fn cmd_status(cwd: &Path, args: cli::StatusArgs) -> Result<()> {
             "symbolsIndexed": stats.symbols,
             "projects": stats.projects,
             "packages": stats.packages,
+            "referenceEdges": stats.reference_edges,
+            // Languages for which usage/reference edges are extracted today.
+            // Surfaced so partial coverage is visible rather than silent.
+            "referenceLanguages": ["csharp", "rust", "typescript", "javascript"],
             "staleFiles": stale.len(),
             "untrackedFiles": untracked.len(),
             "branch": info.branch,
@@ -273,6 +277,7 @@ fn cmd_status(cwd: &Path, args: cli::StatusArgs) -> Result<()> {
     println!("Graph path: {}", config.graph.path);
     println!("Files indexed: {}", fmt_num(stats.files));
     println!("Symbols indexed: {}", fmt_num(stats.symbols));
+    println!("Reference edges: {}", fmt_num(stats.reference_edges));
     println!("Stale files: {}", fmt_num(stale.len()));
     println!("Untracked files: {}", fmt_num(untracked.len()));
     if !last_index.is_empty() {

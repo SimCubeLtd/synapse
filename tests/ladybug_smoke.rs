@@ -84,3 +84,45 @@ fn ladybug_roundtrip_file_and_symbol() {
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn ladybug_reference_edge_roundtrips() {
+    let path = temp_db_path("refedge");
+    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_file(&path);
+
+    let store = LadybugGraphStore::open(&path).expect("open");
+    store.initialize_schema().expect("schema");
+
+    let mk = |id: &str, name: &str, file: &str| IndexedSymbol {
+        id: id.into(),
+        name: name.into(),
+        full_name: name.into(),
+        kind: SymbolKind::Class,
+        language: Language::CSharp,
+        file_path: file.into(),
+        start_line: 1,
+        end_line: 2,
+        visibility: "public".into(),
+        exported: true,
+    };
+    // Target (declared) and referrer (the enclosing decl that uses it).
+    store.upsert_symbol(mk("sym:a.cs#class#Employee#1", "Employee", "a.cs")).unwrap();
+    store.upsert_symbol(mk("sym:b.cs#class#Attendance#1", "Attendance", "b.cs")).unwrap();
+    store
+        .link_symbol_references("sym:b.cs#class#Attendance#1", "sym:a.cs#class#Employee#1")
+        .expect("link references");
+
+    // The referrer file must come back via symbol_references on the target name.
+    let refs = store.symbol_references("Employee").expect("symbol_references");
+    assert_eq!(
+        refs.len(),
+        1,
+        "exactly one referrer expected, got {refs:?}"
+    );
+    assert_eq!(refs[0].path, "b.cs");
+    assert_eq!(store.stats().unwrap().reference_edges, 1);
+
+    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_file(&path);
+}

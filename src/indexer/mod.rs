@@ -129,6 +129,9 @@ pub fn index_repo(
     // Supertype relationships collected per file, resolved to INHERITS/IMPLEMENTS
     // edges in a second pass once every symbol exists.
     let mut pending_supertypes: Vec<(String, Vec<tree_sitter::Supertype>)> = Vec::new();
+    // Reference relationships collected per file, resolved to REFERENCES edges
+    // in a second pass once every symbol (the link targets) exists.
+    let mut pending_references: Vec<(String, Vec<tree_sitter::Reference>)> = Vec::new();
 
     // Live tally for the progress display (projects aren't in `outcome`, which
     // only tracks files/symbols/edges). Package counts need post-pass dedup, so
@@ -214,6 +217,12 @@ pub fn index_repo(
             if !supers.is_empty() {
                 pending_supertypes.push((rel.clone(), supers));
             }
+
+            // Collect usage references for later REFERENCES edges.
+            let refs = tree_sitter::extract_references(rel, language, &text);
+            if !refs.is_empty() {
+                pending_references.push((rel.clone(), refs));
+            }
         }
 
         // Manifest parsing -> projects/packages/edges.
@@ -236,6 +245,12 @@ pub fn index_repo(
     // the main loop so all symbols (the link targets) exist.
     if !pending_supertypes.is_empty() {
         outcome.edges += resolve_supertypes(store, &pending_supertypes)?;
+    }
+
+    // Resolve usage references -> REFERENCES edges. Done after the main loop so
+    // all declarations (the link targets) exist — references are cross-file.
+    if !pending_references.is_empty() {
+        outcome.edges += resolve_references(store, &pending_references)?;
     }
 
     // Associate every indexed file with its nearest owning project manifest,
@@ -387,6 +402,92 @@ fn resolve_supertypes(
                 } else {
                     store.link_symbol_inherits(&child.id, &target.id)?;
                 }
+                edges += 1;
+            }
+        }
+    }
+    Ok(edges)
+}
+
+/// Resolve collected usage references into `REFERENCES` edges. Returns the
+/// number of edges created.
+///
+/// For each `(file, [from -> to])`:
+/// * `from` (the enclosing declaration) must be a symbol declared in this file.
+///   References with no enclosing declaration (top-level/module-scope usages)
+///   are skipped — the schema's `REFERENCES` edge requires a Symbol on both
+///   ends, and there is no file-level pseudo-symbol to anchor to.
+/// * `to` candidates are all symbols with the matching name. The same ambiguity
+///   policy as `resolve_supertypes` applies: prefer same-file, then same-project
+///   (directory prefix), else link every candidate. Ambiguity yields multiple
+///   edges, never a guess.
+/// * A `to` that matches no declared symbol yields no edge — this is the guard
+///   against local variables shadowing a global name.
+fn resolve_references(
+    store: &dyn GraphStore,
+    pending: &[(String, Vec<tree_sitter::Reference>)],
+) -> Result<usize> {
+    use crate::graph::model::SymbolSearchQuery;
+
+    let mut edges = 0;
+    for (file, refs) in pending {
+        let project_prefix = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        for r in refs {
+            // The referring symbol must be a declaration in this file.
+            if r.from.is_empty() {
+                continue;
+            }
+            let from_candidates = store.symbols_matching(&SymbolSearchQuery {
+                name: Some(r.from.clone()),
+                file: Some(file.clone()),
+                ..Default::default()
+            })?;
+            let Some(from) = from_candidates.into_iter().find(|s| s.name == r.from) else {
+                continue;
+            };
+
+            // Candidate target symbols (exact name match, any file). An empty
+            // set means the name isn't a declared symbol (e.g. a local var) —
+            // no edge, which is the false-positive guard.
+            let mut targets: Vec<_> = store
+                .symbols_matching(&SymbolSearchQuery {
+                    name: Some(r.to.clone()),
+                    ..Default::default()
+                })?
+                .into_iter()
+                .filter(|s| s.name == r.to && s.id != from.id)
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+
+            // Ambiguity policy mirrors resolve_supertypes: prefer same-file,
+            // then same-project; only fall back to all candidates if neither.
+            let same_file: Vec<_> = targets
+                .iter()
+                .filter(|s| s.file_path == *file)
+                .cloned()
+                .collect();
+            if !same_file.is_empty() {
+                targets = same_file;
+            } else {
+                let same_proj: Vec<_> = targets
+                    .iter()
+                    .filter(|s| {
+                        !project_prefix.is_empty() && s.file_path.starts_with(project_prefix)
+                    })
+                    .cloned()
+                    .collect();
+                if !same_proj.is_empty() {
+                    targets = same_proj;
+                }
+            }
+
+            // Deterministic order when an ambiguous name produces multiple
+            // edges (sort by target file path).
+            targets.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.id.cmp(&b.id)));
+            for target in targets {
+                store.link_symbol_references(&from.id, &target.id)?;
                 edges += 1;
             }
         }
