@@ -34,8 +34,10 @@ jobs:
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
+          # NOTE: no aarch64-pc-windows-msvc target — LadybugDB (lbug) ships no
+          # prebuilt static lib for Windows arm64 and its C++ can't be built
+          # from source there in CI. Windows-on-ARM runs the x86_64 build under
+          # emulation. Revisit if upstream adds a windows-aarch64 release asset.
 
     steps:
       - uses: actions/checkout@v4
