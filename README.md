@@ -159,3 +159,83 @@ src/
 All LadybugDB-specific code is isolated in `src/graph/ladybug_store.rs` behind
 the `GraphStore` trait, so the storage backend stays replaceable and testable.
 A `MemoryGraphStore` backs unit tests; the production CLI always uses LadybugDB.
+
+## Claude
+
+Get claude to create a memory, that prefers the tool usage over raw grep.
+
+```markdown
+Save this as a memory called reference_synapse_cli.md in this project's memory directory, and add a one-line entry for it to MEMORY.md so it shows up in the index. Here's the content:
+
+---
+name: reference-synapse-cli
+description: "synapse CLI — local offline graph index of the repo; use BEFORE grep/glob/Explore to pull focused, token-budgeted context."
+metadata:
+  node_type: memory
+  type: reference
+---
+
+`synapse` is a deterministic, offline Rust CLI that indexes a repo into a local graph (LadybugDB at `.synapse/`) and emits focused, token-budgeted context packs. No network, no AI, no daemon. **Prefer it over reading whole files or running multi-file grep sweeps** when you need to understand or modify code.
+
+## Setup (once per repo)
+\```bash
+synapse init            # creates .synapse/
+synapse index           # build the graph (incremental, blake3-hashed, safe to repeat)
+synapse status --json   # confirm: filesIndexed, symbolsIndexed, referenceEdges, referenceLanguages
+\```
+
+Re-run `synapse index` after code changes; `status` reports `staleFiles`.
+
+## When to reach for it
+- Before editing a known file: **`synapse pack --path <file> --format json --budget 20000`** is the killer move — gives the file + same-directory siblings (events, exceptions, supporting types) in one call. Replaces 5–7 sequential Reads when working in a domain slice.
+- "Who emits/calls/instantiates X" — **`synapse related --symbol X --json`** returns true reference sites via the REFERENCES edge (C#/Rust/JS/TS). **Replaces grep for symbol impact analysis on supported languages.**
+- Before editing a symbol: `synapse pack --symbol <Name> --format json --budget 20000` pulls the declaration + all reference sites at tier 1, ahead of same-directory noise.
+- Before editing the working tree: `synapse pack --changed --format json` to see exactly what's about to be touched plus related context.
+- Symbol lookup faster than grep: `synapse symbols <query> --kind class --json` — fast, precise.
+- Dependency impact analysis: `synapse packages --importers <pkg> --json` — beats grep for "what would a library upgrade touch?".
+- Skip when: you already know the exact file path AND need the full contents (just Read it); you need full-text content search inside strings/comments/log messages (synapse correctly ignores comments — grep for those); the target language is Python/Go/Svelte (no REFERENCES yet — check `status` `referenceLanguages`).
+
+## Contract
+- **stdout = data, stderr = diagnostics.** Capture stdout, ignore stderr. Exit 0 = ok, 1 = error.
+- Pass `--json` (or `pack --format json`) for machine-parseable output — always prefer this when consuming programmatically.
+- Deterministic; all paths repo-relative with forward slashes.
+- If a command errors "no Synapse workspace" / "run `synapse index` first" → run `synapse index`. Use `synapse index --changed` on big repos.
+
+## `pack` — the main tool
+Pick exactly ONE selection mode: `--symbol <Name>`, `--changed`, `--path <dir|file>`, or `--query <text>`. Useful flags:
+- `--format json` (structured: `{request, repository, selection[], symbols[], files[{path,language,contents}], diff?}`)
+- `--budget <N>` token cap (default 40000; over-budget files listed as `included:false`)
+- `--depth <N>` graph expansion (default 1)
+- `--dry-run` selection + symbols only, no contents (cheap preview)
+- `--explain` print ranking tier/reason (to stderr)
+- `--include-tests` / `--include-config` / `--include-diff` / `--output <file>`
+
+Selection ranking (high→low): changed / exact-symbol / exact-path → graph relations (same project, base types, implementors, imports, **references**) → tests/config/same-dir → docs. Generated files, lockfiles, minified bundles excluded.
+
+## Other commands
+- `synapse symbols <query> [--kind <k>] [--language <l>] [--file <path>] [--json]` — kinds: class struct record interface trait enum function method module type component constructor key. Languages: csharp rust python go javascript typescript svelte bash yaml json markdown.
+- `synapse related --symbol <Name>` or `--file <path>` `[--depth N] [--json]`
+- `synapse packages [--json] [--projects] [--importers <pkg>]` — last form is impact analysis: which files import a package. CPM-resolved for .NET.
+- `synapse explore` — Ladybug Explorer UI on :8000 (needs Docker); `--print` to just print the docker command.
+
+## Graph contents
+Nodes: Repository, Project, Package, File, Symbol. Populated edges: DECLARES, CONTAINS_FILE, REFERENCES_PROJECT, USES_PACKAGE, IMPORTS_PACKAGE (JS/TS + C#), INHERITS, IMPLEMENTS, **REFERENCES (symbol→symbol: `new`/call/type use; C#/Rust/JS/TS only as of v0.1.5 — check `status.referenceLanguages`).** CALLS is folded into REFERENCES; the legacy edge is empty, don't rely on it. Edge resolution is name-based (no type inference): ambiguous names may link to multiple symbols (prefers same-file/project). `related --symbol`/`pack --symbol` need exact (case-insensitive) name match to seed. **REFERENCES are anchored to the enclosing declaration** — a usage at file/module top-level (outside any function/type) is not captured.
+
+## Symbol extraction by language
+C#, Rust, Python, Go, JS/TS (+JSX/TSX), Svelte (component + script symbols + SvelteKit route roles), Bash (functions), YAML/JSON (top-level keys), Markdown (headings as `key` symbols).
+
+## Gotchas (learned from real use)
+- **`related --symbol` can explode on overloaded names at depth 1.** A name declared in many files makes "same project" at depth 1 pull the entire enclosing project. The REFERENCES results come first (good) but the same-project noise still bloats the JSON — filter on `reason` containing `"references"` or `"declares"` when you only care about real call sites, or use `--path <file>` for narrow scope.
+- **Always budget-cap `pack`.** Output is huge by default (40k token budget). For most domain-slice work, `--budget 20000` is plenty. Use `--dry-run` first when unsure — it shows selection + estimated tokens without the contents.
+- **REFERENCES only covers C#/Rust/JS/TS** (v0.1.5). Python, Go, Svelte declarations index fine but their call sites won't show up via `related`. Confirm coverage with `synapse status --json` → `referenceLanguages`.
+- **REFERENCES needs an enclosing declaration.** A `new Foo()` at module top-level (outside any function/method/class) is not captured. Rare in C#/Rust, more common in TS/JS init code — grep if you suspect a top-level call site.
+- **`symbols`/`--query` match names+paths, not file bodies.** For text inside files (string literals, comments, log messages), use grep. **Comments are correctly ignored** by REFERENCES — a "see `UserRegistered` in XYZ" doc comment is NOT a reference and won't show up.
+- **Pipe big JSON through `python3 -c`/`jq`** instead of `head` — the file list is what you want, raw JSON dumps blow up context.
+
+## Verdict (measured head-to-head vs grep)
+- **Find related classes**: synapse finds ~4× more relevant classes than naive `grep "class X"` (catches names *containing* X, not just prefix matches).
+- **Find usages**: filtered `related --symbol` returns the actionable list; raw `grep -l` returns ~6× more files (substring matches in unrelated names, comment hits, doc references).
+- **Get a domain slice**: `pack --path` is 1 call + automatic budget enforcement; the grep equivalent is 1 `ls` + N `Read` calls with no ranking.
+
+Use synapse first. Reach for grep only when (a) you need text inside strings/comments/log messages, (b) the language isn't in `referenceLanguages` yet, or (c) you're hunting a top-level usage outside any declaration.
+```
