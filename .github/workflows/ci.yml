@@ -11,7 +11,9 @@ env:
 jobs:
   check:
     name: fmt + clippy + test
-    runs-on: ubuntu-22.04
+    # 24.04 ships GCC 13+, whose libstdc++ provides <format> — required by
+    # lbug (LadybugDB) 0.17's C++ headers. 22.04 (GCC 11) fails to compile it.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
