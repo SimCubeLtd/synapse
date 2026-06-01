@@ -428,10 +428,16 @@ impl GraphStore for LadybugGraphStore {
             Ok(())
         })();
         match result {
-            Ok(()) => conn
-                .query("COMMIT")
-                .map(|_| ())
-                .map_err(|e| anyhow!("commit transaction: {e}")),
+            Ok(()) => match conn.query("COMMIT") {
+                Ok(_) => Ok(()),
+                // A failed COMMIT leaves the transaction open; roll it back
+                // (best effort) before surfacing the error, mirroring the
+                // mid-batch error path so we never leave a dangling txn/lock.
+                Err(e) => {
+                    let _ = conn.query("ROLLBACK");
+                    Err(anyhow!("commit transaction: {e}"))
+                }
+            },
             Err(err) => {
                 // Best-effort rollback; report the original error.
                 let _ = conn.query("ROLLBACK");
