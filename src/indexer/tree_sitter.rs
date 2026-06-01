@@ -30,7 +30,7 @@ pub fn extract(path: &str, lang: Language, text: &str) -> Result<Vec<IndexedSymb
         Language::Other => Ok(Vec::new()),
     }
     .unwrap_or_else(|e| {
-        tracing::debug!("symbol extraction failed for {path}: {e}");
+        tracing::warn!("symbol extraction failed for {path}: {e}");
         Vec::new()
     });
 
@@ -1125,7 +1125,7 @@ pub fn extract_supertypes(path: &str, lang: Language, text: &str) -> Vec<Superty
         _ => Ok(Vec::new()),
     };
     let mut out = result.unwrap_or_else(|e| {
-        tracing::debug!("supertype extraction failed for {path}: {e}");
+        tracing::warn!("supertype extraction failed for {path}: {e}");
         Vec::new()
     });
     out.sort_by(|a, b| {
@@ -1468,7 +1468,7 @@ pub fn extract_references(path: &str, lang: Language, text: &str) -> Vec<Referen
         _ => Ok(Vec::new()),
     };
     let mut out = result.unwrap_or_else(|e| {
-        tracing::debug!("reference extraction failed for {path}: {e}");
+        tracing::warn!("reference extraction failed for {path}: {e}");
         Vec::new()
     });
     out.sort_by(|a, b| a.from.cmp(&b.from).then_with(|| a.to.cmp(&b.to)));

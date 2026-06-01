@@ -357,22 +357,29 @@ impl GraphStore for LadybugGraphStore {
     fn symbol_type_relations(&self, symbol_name: &str) -> Result<Vec<RelatedItem>> {
         let _guard = self.lock.lock().unwrap();
         let conn = self.conn()?;
-        // Four directed traversals; each returns (file_path, reason).
+        // Four directed traversals; each returns (file_path, reason). Name
+        // matching is case-insensitive (lowercased param vs `lower(name)`) to
+        // align with the case-insensitive seed used by pack/related.
+        let name_lc = symbol_name.to_ascii_lowercase();
         let queries = [
             (
-                "MATCH (s:Symbol {name: $n})-[:INHERITS]->(t:Symbol) RETURN DISTINCT t.filePath",
+                "MATCH (s:Symbol)-[:INHERITS]->(t:Symbol) WHERE lower(s.name) = $n \
+                 RETURN DISTINCT t.filePath",
                 "base type (inherits)",
             ),
             (
-                "MATCH (s:Symbol)-[:INHERITS]->(t:Symbol {name: $n}) RETURN DISTINCT s.filePath",
+                "MATCH (s:Symbol)-[:INHERITS]->(t:Symbol) WHERE lower(t.name) = $n \
+                 RETURN DISTINCT s.filePath",
                 "subtype (inherits)",
             ),
             (
-                "MATCH (s:Symbol {name: $n})-[:IMPLEMENTS]->(t:Symbol) RETURN DISTINCT t.filePath",
+                "MATCH (s:Symbol)-[:IMPLEMENTS]->(t:Symbol) WHERE lower(s.name) = $n \
+                 RETURN DISTINCT t.filePath",
                 "implemented interface/trait",
             ),
             (
-                "MATCH (s:Symbol)-[:IMPLEMENTS]->(t:Symbol {name: $n}) RETURN DISTINCT s.filePath",
+                "MATCH (s:Symbol)-[:IMPLEMENTS]->(t:Symbol) WHERE lower(t.name) = $n \
+                 RETURN DISTINCT s.filePath",
                 "implementor",
             ),
         ];
@@ -382,10 +389,7 @@ impl GraphStore for LadybugGraphStore {
                 .prepare(cypher)
                 .map_err(|e| anyhow!("preparing symbol_type_relations: {e}"))?;
             let result = conn
-                .execute(
-                    &mut stmt,
-                    vec![("n", Value::String(symbol_name.to_string()))],
-                )
+                .execute(&mut stmt, vec![("n", Value::String(name_lc.clone()))])
                 .map_err(|e| anyhow!("executing symbol_type_relations: {e}"))?;
             for row in result {
                 out.push(RelatedItem {
@@ -403,16 +407,17 @@ impl GraphStore for LadybugGraphStore {
     fn symbol_references(&self, symbol_name: &str) -> Result<Vec<RelatedItem>> {
         let _guard = self.lock.lock().unwrap();
         let conn = self.conn()?;
-        // Incoming REFERENCES edges = files that reference this symbol.
-        let cypher =
-            "MATCH (s:Symbol)-[:REFERENCES]->(t:Symbol {name: $n}) RETURN DISTINCT s.filePath";
+        // Incoming REFERENCES edges = files that reference this symbol. Name
+        // matching is case-insensitive to align with the seed lookup.
+        let cypher = "MATCH (s:Symbol)-[:REFERENCES]->(t:Symbol) WHERE lower(t.name) = $n \
+                      RETURN DISTINCT s.filePath";
         let mut stmt = conn
             .prepare(cypher)
             .map_err(|e| anyhow!("preparing symbol_references: {e}"))?;
         let result = conn
             .execute(
                 &mut stmt,
-                vec![("n", Value::String(symbol_name.to_string()))],
+                vec![("n", Value::String(symbol_name.to_ascii_lowercase()))],
             )
             .map_err(|e| anyhow!("executing symbol_references: {e}"))?;
         let reason = format!("references {symbol_name}");
@@ -564,13 +569,17 @@ impl GraphStore for LadybugGraphStore {
         {
             let _guard = self.lock.lock().unwrap();
             let conn = self.conn()?;
-            let cypher =
-                "MATCH (s:Symbol {name: $name}) RETURN DISTINCT s.filePath ORDER BY s.filePath";
+            // Case-insensitive to align with the seed lookup.
+            let cypher = "MATCH (s:Symbol) WHERE lower(s.name) = $name \
+                          RETURN DISTINCT s.filePath ORDER BY s.filePath";
             let mut stmt = conn
                 .prepare(cypher)
                 .map_err(|e| anyhow!("preparing related query: {e}"))?;
             let result = conn
-                .execute(&mut stmt, vec![("name", Value::String(symbol.to_string()))])
+                .execute(
+                    &mut stmt,
+                    vec![("name", Value::String(symbol.to_ascii_lowercase()))],
+                )
                 .map_err(|e| anyhow!("executing related query: {e}"))?;
             for row in result {
                 out.push(RelatedItem {

@@ -47,6 +47,36 @@ fn ci_contains(haystack: &str, needle: &str) -> bool {
         .contains(&needle.to_ascii_lowercase())
 }
 
+/// Files that reference `symbol_name` via incoming `REFERENCES` edges (callers
+/// / instantiation sites), deterministic and de-duplicated by path. Name match
+/// is case-insensitive to align with the seed lookup. Lock-free so it can be
+/// called from methods that already hold the inner mutex (the single source of
+/// truth for both `symbol_references` and `related_to_symbol`'s reference half).
+fn collect_references(g: &Inner, symbol_name: &str) -> Vec<RelatedItem> {
+    let target_ids: BTreeSet<&str> = g
+        .symbols
+        .values()
+        .filter(|s| s.name.eq_ignore_ascii_case(symbol_name))
+        .map(|s| s.id.as_str())
+        .collect();
+    let reason = format!("references {symbol_name}");
+    let mut out: Vec<RelatedItem> = Vec::new();
+    for (from, to) in &g.sym_references {
+        if target_ids.contains(to.as_str())
+            && let Some(s) = g.symbols.get(from)
+        {
+            out.push(RelatedItem {
+                path: s.file_path.clone(),
+                reason: reason.clone(),
+                depth: 1,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out.dedup_by(|a, b| a.path == b.path);
+    out
+}
+
 impl GraphStore for MemoryGraphStore {
     fn initialize_schema(&self) -> Result<()> {
         Ok(())
@@ -72,14 +102,16 @@ impl GraphStore for MemoryGraphStore {
         // Drop the file's IMPORTS_PACKAGE edges and project membership.
         g.file_pkgs.retain(|(f, _)| f != &fid);
         g.project_files.retain(|(_, f)| f != &fid);
-        // Drop symbol-level edges originating from this file's symbols.
-        let sym_prefix = format!("sym:{path}#");
-        g.sym_inherits
-            .retain(|(from, _)| !from.starts_with(&sym_prefix));
-        g.sym_implements
-            .retain(|(from, _)| !from.starts_with(&sym_prefix));
-        g.sym_references
-            .retain(|(from, _)| !from.starts_with(&sym_prefix));
+        // Drop symbol-level edges whose *either* endpoint no longer exists. The
+        // symbols are already removed above, so retaining only edges with both
+        // endpoints live cleans up references in both directions — including
+        // edges that merely *point at* a symbol declared in the removed file.
+        // (A `from`-only sweep would leak those and inflate `referenceEdges`.)
+        let live: BTreeSet<String> = g.symbols.keys().cloned().collect();
+        let both_live = |(from, to): &(String, String)| live.contains(from) && live.contains(to);
+        g.sym_inherits.retain(both_live);
+        g.sym_implements.retain(both_live);
+        g.sym_references.retain(both_live);
         Ok(())
     }
 
@@ -165,38 +197,17 @@ impl GraphStore for MemoryGraphStore {
 
     fn symbol_references(&self, symbol_name: &str) -> Result<Vec<RelatedItem>> {
         let g = self.inner.lock().unwrap();
-        // Symbol ids declaring this name (the reference targets).
-        let ids: BTreeSet<&str> = g
-            .symbols
-            .values()
-            .filter(|s| s.name == symbol_name)
-            .map(|s| s.id.as_str())
-            .collect();
-        let reason = format!("references {symbol_name}");
-        let mut out: Vec<RelatedItem> = Vec::new();
-        for (from, to) in &g.sym_references {
-            if ids.contains(to.as_str())
-                && let Some(s) = g.symbols.get(from)
-            {
-                out.push(RelatedItem {
-                    path: s.file_path.clone(),
-                    reason: reason.clone(),
-                    depth: 1,
-                });
-            }
-        }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        out.dedup_by(|a, b| a.path == b.path);
-        Ok(out)
+        Ok(collect_references(&g, symbol_name))
     }
 
     fn symbol_type_relations(&self, symbol_name: &str) -> Result<Vec<RelatedItem>> {
         let g = self.inner.lock().unwrap();
-        // Symbol ids declaring this name.
+        // Symbol ids declaring this name (case-insensitive, to align with the
+        // seed lookup used by pack/related).
         let ids: BTreeSet<&str> = g
             .symbols
             .values()
-            .filter(|s| s.name == symbol_name)
+            .filter(|s| s.name.eq_ignore_ascii_case(symbol_name))
             .map(|s| s.id.as_str())
             .collect();
         let file_of = |id: &str| g.symbols.get(id).map(|s| s.file_path.clone());
@@ -293,11 +304,9 @@ impl GraphStore for MemoryGraphStore {
     fn related_to_symbol(&self, symbol: &str, _depth: usize) -> Result<Vec<RelatedItem>> {
         let g = self.inner.lock().unwrap();
         let mut out = Vec::new();
-        // Files declaring an exactly-named symbol are depth 0.
-        let mut target_ids: BTreeSet<&str> = BTreeSet::new();
+        // Files declaring a symbol of this name (case-insensitive) are depth 0.
         for s in g.symbols.values() {
-            if s.name == symbol {
-                target_ids.insert(s.id.as_str());
+            if s.name.eq_ignore_ascii_case(symbol) {
                 out.push(RelatedItem {
                     path: s.file_path.clone(),
                     reason: "exact symbol declaration".to_string(),
@@ -306,21 +315,10 @@ impl GraphStore for MemoryGraphStore {
             }
         }
         // Files that reference the symbol via incoming REFERENCES edges are
-        // depth 1 (callers/instantiation sites). This traversal is what makes
-        // usages visible to `pack`/`related`. Mirror the lock-free inline form
-        // of `symbol_references` to avoid re-locking the mutex.
-        let reason = format!("references {symbol}");
-        for (from, to) in &g.sym_references {
-            if target_ids.contains(to.as_str())
-                && let Some(s) = g.symbols.get(from)
-            {
-                out.push(RelatedItem {
-                    path: s.file_path.clone(),
-                    reason: reason.clone(),
-                    depth: 1,
-                });
-            }
-        }
+        // depth 1 (callers/instantiation sites) — the traversal that makes
+        // usages visible to `pack`/`related`. Shares `collect_references` (the
+        // single source of truth) while still holding the lock once.
+        out.extend(collect_references(&g, symbol));
         // Deterministic; declaration (depth 0) wins over reference (depth 1)
         // when the same file both declares and references the symbol.
         out.sort_by(|a, b| a.path.cmp(&b.path).then(a.depth.cmp(&b.depth)));
