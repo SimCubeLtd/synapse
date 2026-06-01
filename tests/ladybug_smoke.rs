@@ -107,19 +107,21 @@ fn ladybug_reference_edge_roundtrips() {
         exported: true,
     };
     // Target (declared) and referrer (the enclosing decl that uses it).
-    store.upsert_symbol(mk("sym:a.cs#class#Employee#1", "Employee", "a.cs")).unwrap();
-    store.upsert_symbol(mk("sym:b.cs#class#Attendance#1", "Attendance", "b.cs")).unwrap();
+    store
+        .upsert_symbol(mk("sym:a.cs#class#Employee#1", "Employee", "a.cs"))
+        .unwrap();
+    store
+        .upsert_symbol(mk("sym:b.cs#class#Attendance#1", "Attendance", "b.cs"))
+        .unwrap();
     store
         .link_symbol_references("sym:b.cs#class#Attendance#1", "sym:a.cs#class#Employee#1")
         .expect("link references");
 
     // The referrer file must come back via symbol_references on the target name.
-    let refs = store.symbol_references("Employee").expect("symbol_references");
-    assert_eq!(
-        refs.len(),
-        1,
-        "exactly one referrer expected, got {refs:?}"
-    );
+    let refs = store
+        .symbol_references("Employee")
+        .expect("symbol_references");
+    assert_eq!(refs.len(), 1, "exactly one referrer expected, got {refs:?}");
     assert_eq!(refs[0].path, "b.cs");
     assert_eq!(store.stats().unwrap().reference_edges, 1);
 
