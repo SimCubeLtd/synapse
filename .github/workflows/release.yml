@@ -52,8 +52,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # lbug (LadybugDB) statically compiles a C++ library; the platform's
-      # default toolchain (gcc/clang/MSVC) on each native runner is sufficient.
+      # lbug links its static C++ archive with `+whole-archive`; the Xcode 15+
+      # linker treats the resulting duplicate symbols as a hard error, so on
+      # macOS we fall back to the classic linker (which warns instead). Other
+      # platforms use the default toolchain (gcc/clang/MSVC) unchanged.
+      - name: Set macOS linker flags
+        if: runner.os == 'macOS'
+        run: echo "RUSTFLAGS=-C link-arg=-Wl,-ld_classic" >> "$GITHUB_ENV"
+
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
