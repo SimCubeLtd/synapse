@@ -40,6 +40,12 @@ fn config_default_roundtrips_through_toml() {
     let toml = cfg.to_toml().expect("serialize");
     assert!(toml.contains("backend = \"ladybug\""));
     assert!(toml.contains("default_budget = 40000"));
+    // The [share] section persists and is pull-only by default.
+    assert!(toml.contains("[share]"), "share section present: {toml}");
+    assert!(
+        toml.contains("push_enabled = false"),
+        "push disabled by default: {toml}"
+    );
     let parsed: SynapseConfig = toml::from_str(&toml).expect("parse");
     assert_eq!(parsed, cfg);
 }

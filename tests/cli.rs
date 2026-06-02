@@ -538,3 +538,160 @@ fn test_explore_print_command() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+// --- share (push/pull) guard tests ------------------------------------------
+// These verify the safety gates with NO network: a fresh/default workspace must
+// never push, and misconfiguration must fail loudly. They assume the binary was
+// built with the default `share` feature.
+
+/// A git repo with one committed file, so HEAD resolves to a real commit (the
+/// share tests need a commit to tag the graph by). `git_init` alone makes an
+/// empty repo with no HEAD when there are no fixtures to commit.
+fn git_repo_with_commit(name: &str) -> PathBuf {
+    let dir = make_temp_dir(name);
+    std::fs::write(dir.join("README.md"), "# test\n").unwrap();
+    git_init(&dir);
+    dir
+}
+
+/// Enable push + set a (fake) registry/repository in an initialized workspace.
+fn enable_push_config(dir: &Path) {
+    let cfg = dir.join(".synapse/synapse.toml");
+    let text = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("push_enabled = false", "push_enabled = true")
+        .replace("registry = \"\"", "registry = \"localhost:5000\"")
+        .replace("repository = \"\"", "repository = \"team/graph\"");
+    std::fs::write(&cfg, text).unwrap();
+}
+
+/// `synapse push` on a default workspace must refuse: push is disabled.
+#[test]
+fn test_push_disabled_by_default() {
+    let dir = make_temp_dir("push_disabled");
+    git_init(&dir);
+    run_ok(&dir, &["init", "--name", "p"]);
+    let out = run(&dir, &["push", "--yes"]);
+    assert!(!out.status.success(), "push must fail when disabled");
+    assert!(
+        stderr(&out).contains("push is disabled"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// With push enabled but no registry/repository, push must report the
+/// misconfiguration rather than attempting any network call.
+#[test]
+fn test_push_enabled_but_unconfigured() {
+    let dir = make_temp_dir("push_unconfigured");
+    git_init(&dir);
+    run_ok(&dir, &["init", "--name", "p"]);
+    // Enable push in the config (registry/repository left empty).
+    let cfg = dir.join(".synapse/synapse.toml");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text = text.replace("push_enabled = false", "push_enabled = true");
+    std::fs::write(&cfg, text).unwrap();
+
+    let out = run(&dir, &["push", "--yes"]);
+    assert!(!out.status.success(), "push must fail when unconfigured");
+    assert!(
+        stderr(&out).contains("share target not configured"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// Push from a dirty working tree must refuse without --allow-dirty.
+#[test]
+fn test_push_refuses_dirty_tree() {
+    let dir = git_repo_with_commit("push_dirty");
+    run_ok(&dir, &["init", "--name", "p"]);
+    enable_push_config(&dir);
+    // Make the tree dirty with a new file, and index so the graph exists.
+    std::fs::write(dir.join("dirty.txt"), "uncommitted").unwrap();
+    run_ok(&dir, &["index"]);
+
+    let out = run(&dir, &["push", "--yes"]);
+    assert!(!out.status.success(), "push must fail on a dirty tree");
+    assert!(
+        stderr(&out).contains("uncommitted changes"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// Non-interactive push without --yes must refuse rather than hang (the test
+/// harness has no TTY on stdin).
+#[test]
+fn test_push_non_interactive_without_yes() {
+    let dir = git_repo_with_commit("push_no_tty");
+    run_ok(&dir, &["init", "--name", "p"]);
+    enable_push_config(&dir);
+    run_ok(&dir, &["index"]);
+
+    // No --yes, stdin is not a TTY → must refuse (not block). Pass
+    // --allow-dirty so we reach the confirmation guard (the untracked
+    // .synapse/ dir would otherwise trip the dirty-tree guard first).
+    let out = run(&dir, &["push", "--allow-dirty"]);
+    assert!(
+        !out.status.success(),
+        "push must refuse without confirmation"
+    );
+    assert!(
+        stderr(&out).contains("not confirmed"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// `synapse pull` with no configured registry must report misconfiguration.
+#[test]
+fn test_pull_unconfigured() {
+    let dir = git_repo_with_commit("pull_unconfigured");
+    run_ok(&dir, &["init", "--name", "p"]);
+    let out = run(&dir, &["pull"]);
+    assert!(!out.status.success(), "pull must fail when unconfigured");
+    assert!(
+        stderr(&out).contains("share target not configured"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// `synapse init` adds the graph dir to an existing root .gitignore (so the
+/// multi-MB graph isn't committed), but leaves a repo without one untouched.
+#[test]
+fn test_init_gitignores_graph_dir() {
+    // With an existing .gitignore: the graph dir gets appended.
+    let dir = git_repo_with_commit("init_gitignore");
+    std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+    run_ok(&dir, &["init", "--name", "p"]);
+    let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert!(
+        gi.contains(".synapse/graph/"),
+        "graph dir should be ignored: {gi}"
+    );
+    // synapse.toml stays committable (not ignored).
+    assert!(
+        !gi.contains("synapse.toml"),
+        "config must stay committable: {gi}"
+    );
+
+    // Idempotent: a second init doesn't duplicate the entry.
+    run_ok(&dir, &["init", "--force", "--name", "p"]);
+    let gi2 = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+    assert_eq!(
+        gi2.matches(".synapse/graph/").count(),
+        1,
+        "entry must not be duplicated: {gi2}"
+    );
+
+    // No .gitignore present → init does not create one.
+    let dir2 = git_repo_with_commit("init_no_gitignore");
+    run_ok(&dir2, &["init", "--name", "p"]);
+    assert!(
+        !dir2.join(".gitignore").exists(),
+        "init must not create a .gitignore where none existed"
+    );
+}

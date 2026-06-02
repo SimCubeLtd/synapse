@@ -15,3 +15,5 @@ pub mod indexer;
 pub mod output;
 pub mod pack;
 pub mod repo;
+#[cfg(feature = "share")]
+pub mod share;

@@ -29,8 +29,46 @@ pub enum Command {
     Pack(PackArgs),
     /// Launch Ladybug Explorer (Docker) to visualize the indexed graph.
     Explore(ExploreArgs),
+    /// Push the indexed graph to the configured OCI registry (restricted).
+    Push(PushArgs),
+    /// Pull an indexed graph from the configured OCI registry.
+    Pull(PullArgs),
     /// Remove cached/index/pack data.
     Clean(CleanArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct PushArgs {
+    /// Override the per-commit tag (defaults to the short HEAD commit SHA).
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Override the configured registry host for this invocation.
+    #[arg(long)]
+    pub registry: Option<String>,
+    /// Override the configured repository for this invocation.
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Skip the interactive type-to-confirm prompt (for CI). Does NOT bypass
+    /// `push_enabled` or the dirty-tree guard.
+    #[arg(long)]
+    pub yes: bool,
+    /// Allow pushing from a working tree with uncommitted changes.
+    #[arg(long)]
+    pub allow_dirty: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct PullArgs {
+    /// Tag to pull (defaults to the HEAD commit tag if present, else the
+    /// configured moving tag).
+    #[arg(long)]
+    pub tag: Option<String>,
+    /// Override the configured registry host for this invocation.
+    #[arg(long)]
+    pub registry: Option<String>,
+    /// Override the configured repository for this invocation.
+    #[arg(long)]
+    pub repository: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]

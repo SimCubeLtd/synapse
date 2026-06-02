@@ -27,4 +27,39 @@ pub enum SynapseError {
     /// The graph backend reported a failure.
     #[error("graph backend error: {0}")]
     Backend(String),
+
+    /// `synapse push` was invoked but `[share].push_enabled` is false.
+    #[error(
+        "push is disabled; set `push_enabled = true` in the [share] section of .synapse/synapse.toml to allow it"
+    )]
+    PushDisabled,
+
+    /// The registry/repository for sharing is not configured.
+    #[error(
+        "share target not configured; set `registry` and `repository` in the [share] section (or pass --registry/--repository)"
+    )]
+    ShareNotConfigured,
+
+    /// Push refused because the working tree has uncommitted changes.
+    #[error(
+        "working tree has uncommitted changes ({0} file(s)); commit/stash or pass --allow-dirty (the graph is tagged by commit)"
+    )]
+    DirtyTree(usize),
+
+    /// Push was not confirmed (interactive prompt declined or non-interactive
+    /// without `--yes`).
+    #[error("push not confirmed (interactive confirmation required, or pass --yes)")]
+    PushNotConfirmed,
+
+    /// A registry network/transport call failed.
+    #[error("registry network error: {0}")]
+    RegistryNetwork(String),
+
+    /// Registry authentication failed.
+    #[error("registry authentication failed: {0}")]
+    RegistryAuth(String),
+
+    /// A pulled graph failed its blake3 integrity check.
+    #[error("pulled graph failed integrity check (blake3 mismatch); the artifact may be corrupt")]
+    IntegrityMismatch,
 }

@@ -52,6 +52,8 @@ synapse pack --symbol MyHandler --output context.md
 synapse pack --changed --budget 40000 --output context.md --explain
 synapse pack --symbol MyHandler --format json     # structured output for tools
 synapse explore                                   # visualize the graph in a browser
+synapse pull                                      # fetch a shared graph from an OCI registry
+synapse push --yes                                # publish the graph (restricted; see below)
 synapse clean --all
 ```
 
@@ -85,7 +87,31 @@ try `--tag dev` or a matching image tag.
 | `packages` | List indexed package dependencies (or `--projects`), with versions resolved via .NET Central Package Management (`--ecosystem`, `--json`). Use `--importers <pkg>` for impact analysis: the files that import a package. |
 | `explore` | Launch [Ladybug Explorer](https://docs.ladybugdb.com/visualization/) (Docker) to visualize the indexed graph in a browser (`--port`, `--read-write`, `--detach`, `--in-memory`, `--tag`, `--print`). Mounts the index read-only by default; `--print` shows the `docker run` command without executing it. |
 | `pack` | Emit a context pack (`--changed`/`--path`/`--symbol`/`--query`, `--budget`, `--include-tests`, `--include-config`, `--include-diff`, `--dry-run`, `--explain`, `--output`). `--format markdown` (default) or `--format json` for programmatic callers. Writes to stdout unless `--output` is given; diagnostics go to stderr. |
+| `pull` | Fetch a shared graph from the configured OCI registry (`--tag`, `--registry`, `--repository`). Verifies integrity (blake3), writes the graph atomically, and warns if its indexed commit differs from local `HEAD`. |
+| `push` | Publish the indexed graph to the configured OCI registry (`--tag`, `--registry`, `--repository`, `--yes`, `--allow-dirty`). Restricted — see [Sharing the graph](#sharing-the-graph-oci-registry). |
 | `clean` | Remove `--cache` / `--index` / `--packs` / `--all`. |
+
+## Sharing the graph (OCI registry)
+
+The indexed graph (`synapse.lbug`) is a multi-MB binary — too heavy for git. Instead, share it with your team via any OCI registry (GHCR, ECR, ACR, Harbor, …): CI (or a maintainer) `push`es the graph, teammates `pull` it instead of re-indexing.
+
+```bash
+# One-time: point the [share] section at your registry (in .synapse/synapse.toml)
+#   [share]
+#   registry = "ghcr.io"
+#   repository = "myorg/myrepo-synapse-graph"
+#   push_enabled = true        # required to allow `push` at all (default false)
+
+synapse pull                   # fetch the current shared graph (tag "latest")
+synapse pull --tag a1b2c3d     # fetch the graph for a specific commit
+synapse push --yes             # publish (CI-friendly; skips the confirm prompt)
+```
+
+- **Credentials are auto-discovered** from your existing `docker login` (`~/.docker/config.json` + OS credential helpers). You do **not** put a token in synapse's config. Public registries pull anonymously with no setup. For headless setups without a docker config, set `SYNAPSE_REGISTRY_USER` + `SYNAPSE_REGISTRY_PASS` (or `SYNAPSE_REGISTRY_TOKEN`).
+- **Push is heavily guarded** (a fresh clone / CI can never push by accident): it requires `push_enabled = true` in config **and** a clean working tree (or `--allow-dirty`) **and** interactive type-to-confirm (or `--yes`). The graph is tagged by commit (a per-commit tag plus the moving `latest`), so a tag always describes a known state.
+- **Staleness is surfaced, never hidden.** `pull` warns loudly when the graph's indexed commit differs from your `HEAD`, and `synapse status` shows the pulled graph's `Origin:` commit on every run. If it's stale, `synapse index` rebuilds locally.
+- **Visibility = the registry's visibility.** The graph encodes file paths, symbol names and dependencies — treat a public registry accordingly.
+- Sharing is the `share` Cargo feature (on by default); a `--no-default-features` build without it drops the networking/TLS stack and the `push`/`pull` commands.
 
 ## Languages
 
