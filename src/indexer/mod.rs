@@ -16,6 +16,7 @@ use crate::graph::GraphStore;
 use crate::graph::model::{IndexedFile, IndexedPackage, IndexedProject, Language};
 use crate::repo::Repo;
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -76,6 +77,143 @@ pub struct IndexProgress {
 /// a plain callback so the indexer stays UI-agnostic — the binary wires this to
 /// a progress bar; tests can ignore it.
 pub type ProgressFn<'a> = dyn Fn(&str, &IndexProgress) + 'a;
+
+/// The result of parsing one candidate file off the main thread — everything
+/// needed to write it to the store, with zero store access. The parallel parse
+/// stage produces one of these per candidate (order-aligned with `candidates`);
+/// the sequential drain consumes them in order, so symbol-insertion and
+/// pending-vec ordering are byte-identical to the old single-threaded loop.
+enum FileWork {
+    /// File was filtered (`--changed`) or unchanged — counted as "skipped
+    /// unchanged" in the outcome, matching the old loop's two `continue`s that
+    /// bumped `files_skipped_unchanged`.
+    SkipCounted,
+    /// File was unreadable — silently skipped with no counter bump, matching the
+    /// old loop's bare `continue` on a read error.
+    SkipUnreadable,
+    /// A changed/new file to (re)index.
+    Indexed(Box<IndexedFileWork>),
+}
+
+/// Parsed facts for one changed file, ready to drain into the store in order.
+struct IndexedFileWork {
+    rel: String,
+    fid: String,
+    file: IndexedFile,
+    /// Extracted symbols (empty for unsupported/disabled languages).
+    symbols: Vec<crate::graph::model::IndexedSymbol>,
+    /// `(imports, language)` for later package resolution, when non-empty.
+    imports: Option<(Vec<String>, Language)>,
+    /// Supertype relationships discovered in this file, when non-empty.
+    supers: Vec<tree_sitter::Supertype>,
+    /// Usage references discovered in this file, when non-empty.
+    references: Vec<tree_sitter::Reference>,
+    /// Parsed manifest (`.csproj`/`package.json`) ready to write, when this file
+    /// is a manifest that parsed successfully.
+    manifest: Option<ManifestWrite>,
+}
+
+/// Read-only inputs shared by every [`parse_file`] call, gathered once before
+/// the parallel parse so each rayon worker borrows them immutably. None of
+/// these are touched by the store, so sharing across threads is safe.
+struct ParseContext<'a> {
+    repo: &'a Repo,
+    config: &'a SynapseConfig,
+    force: bool,
+    changed_only: bool,
+    changed: &'a HashSet<String>,
+    existing: &'a [IndexedFile],
+    tracked: &'a HashSet<String>,
+    central: &'a CentralVersions,
+    now: &'a str,
+}
+
+/// Parse a single candidate file into a [`FileWork`], doing only pure work:
+/// read + hash + skip-decision + language detection + tree-sitter extraction +
+/// manifest parse. No store access — safe to call from a rayon worker thread.
+fn parse_file(ctx: &ParseContext<'_>, rel: &str) -> Result<FileWork> {
+    if ctx.changed_only && !ctx.changed.contains(rel) {
+        // Skip files git didn't flag as changed.
+        return Ok(FileWork::SkipCounted);
+    }
+
+    let abs = ctx.repo.root.join(rel);
+    let bytes = match std::fs::read(&abs) {
+        Ok(b) => b,
+        Err(_) => return Ok(FileWork::SkipUnreadable),
+    };
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let size = bytes.len() as u64;
+
+    // Skip unchanged files (unless forced).
+    if !ctx.force
+        && let Some(prev) = ctx.existing.iter().find(|f| f.path == rel)
+        && prev.hash == hash
+    {
+        return Ok(FileWork::SkipCounted);
+    }
+
+    let language = languages::detect(rel);
+    let fid = file_id(rel);
+    let file = IndexedFile {
+        id: fid.clone(),
+        path: rel.to_string(),
+        language,
+        hash,
+        size_bytes: size,
+        tracked: ctx.tracked.contains(rel),
+        last_indexed_at: ctx.now.to_string(),
+    };
+
+    let mut symbols = Vec::new();
+    let mut imports = None;
+    let mut supers = Vec::new();
+    let mut references = Vec::new();
+
+    // Symbol extraction for supported languages.
+    if language != Language::Other && language_enabled(ctx.config, language) {
+        let text = String::from_utf8_lossy(&bytes);
+        symbols = tree_sitter::extract(rel, language, &text).unwrap_or_default();
+
+        // Collect imports (JS/TS, C#) for later file -> package resolution.
+        if matches!(
+            language,
+            Language::JavaScript | Language::TypeScript | Language::CSharp
+        ) {
+            let imps = tree_sitter::extract_imports(rel, language, &text);
+            if !imps.is_empty() {
+                imports = Some((imps, language));
+            }
+        }
+
+        // Collect supertype relationships for later INHERITS/IMPLEMENTS edges.
+        supers = tree_sitter::extract_supertypes(rel, language, &text);
+
+        // Collect usage references for later REFERENCES edges.
+        references = tree_sitter::extract_references(rel, language, &text);
+    }
+
+    // Manifest parsing -> projects/packages/edges (pure parse only). A parse
+    // error aborts the whole index, exactly as the previous inline `?` did.
+    let manifest = if rel.ends_with(".csproj") {
+        Some(parse_csproj_manifest(rel, &abs, ctx.central)?)
+    } else if rel.ends_with("package.json") {
+        Some(parse_package_json_manifest(rel, &abs)?)
+    } else {
+        None
+    };
+
+    Ok(FileWork::Indexed(Box::new(IndexedFileWork {
+        rel: rel.to_string(),
+        fid,
+        file,
+        symbols,
+        imports,
+        supers,
+        references,
+        manifest,
+    })))
+}
 
 /// Index the repository into `store`.
 ///
@@ -143,7 +281,54 @@ pub fn index_repo(
     let mut projects_seen = 0usize;
 
     let total = candidates.len();
-    for (i, rel) in candidates.iter().enumerate() {
+
+    // Stage 1 — parallel parse. Read + hash + detect + tree-sitter extract +
+    // manifest parse is pure, `Send`, owned-data work (no store access), so it
+    // runs across rayon's thread pool. `par_iter().map().collect()` preserves
+    // input order, so the resulting `Vec` is index-aligned with `candidates` —
+    // the sequential drain below then writes in candidate order, making symbol
+    // insertion and `pending_*` ordering byte-identical to the old loop.
+    if let Some(cb) = progress {
+        cb(
+            "",
+            &IndexProgress {
+                processed: 0,
+                total,
+                files_indexed: 0,
+                symbols: 0,
+                projects: 0,
+                packages: 0,
+                phase: Some("parsing files"),
+            },
+        );
+    }
+    let parse_ctx = ParseContext {
+        repo,
+        config,
+        force,
+        changed_only,
+        changed: &changed,
+        existing: &existing,
+        tracked: &tracked,
+        central: &central,
+        now,
+    };
+    let parsed: Vec<Result<FileWork>> = candidates
+        .par_iter()
+        .map(|rel| parse_file(&parse_ctx, rel))
+        .collect();
+
+    // Stage 2 — sequential drain. Walk the parsed results in candidate order,
+    // accumulating each changed file's node payload into `file_writes` and its
+    // manifest into `manifest_writes`; the pending_* vecs are filled in order
+    // too. No per-symbol store call here — the file/symbol nodes are written in
+    // ONE batched transaction below (the dominant cost otherwise), and manifests
+    // (few, cheap) right after. The store mutex is never touched from a rayon
+    // worker, and write order stays candidate-ordered so output is unchanged.
+    let mut file_writes: Vec<crate::graph::model::FileWrite> = Vec::new();
+    let mut manifest_writes: Vec<ManifestWrite> = Vec::new();
+    for (i, (rel, work)) in candidates.iter().zip(parsed).enumerate() {
+        let work = work?;
         if let Some(cb) = progress {
             let snap = IndexProgress {
                 processed: i + 1,
@@ -156,90 +341,44 @@ pub fn index_repo(
             };
             cb(rel, &snap);
         }
-        if changed_only && !changed.contains(rel) {
-            // Skip files git didn't flag as changed.
-            outcome.files_skipped_unchanged += 1;
-            continue;
-        }
 
-        let abs = repo.root.join(rel);
-        let bytes = match std::fs::read(&abs) {
-            Ok(b) => b,
-            Err(_) => continue,
+        let work = match work {
+            FileWork::SkipCounted => {
+                outcome.files_skipped_unchanged += 1;
+                continue;
+            }
+            FileWork::SkipUnreadable => continue,
+            FileWork::Indexed(w) => w,
         };
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        let size = bytes.len() as u64;
 
-        // Skip unchanged files (unless forced).
-        if !force
-            && let Some(prev) = existing.iter().find(|f| &f.path == rel)
-            && prev.hash == hash
-        {
-            outcome.files_skipped_unchanged += 1;
-            continue;
-        }
-
-        // Changed/new: clear old symbols then re-upsert.
-        store.remove_file(rel)?;
-
-        let language = languages::detect(rel);
-        let fid = file_id(rel);
-        let file = IndexedFile {
-            id: fid.clone(),
-            path: rel.clone(),
-            language,
-            hash,
-            size_bytes: size,
-            tracked: tracked.contains(rel),
-            last_indexed_at: now.to_string(),
-        };
-        store.upsert_file(file)?;
         outcome.files_indexed += 1;
+        outcome.symbols += work.symbols.len();
+        file_writes.push(crate::graph::model::FileWrite {
+            file: work.file,
+            symbols: work.symbols,
+        });
 
-        // Symbol extraction for supported languages.
-        if language != Language::Other && language_enabled(config, language) {
-            let text = String::from_utf8_lossy(&bytes);
-            let symbols = tree_sitter::extract(rel, language, &text).unwrap_or_default();
-            for sym in symbols {
-                let sid = sym.id.clone();
-                store.upsert_symbol(sym)?;
-                store.link_file_declares_symbol(&fid, &sid)?;
-                outcome.symbols += 1;
-            }
-            // Collect imports (JS/TS, C#) for later file -> package resolution.
-            if matches!(
-                language,
-                Language::JavaScript | Language::TypeScript | Language::CSharp
-            ) {
-                let imports = tree_sitter::extract_imports(rel, language, &text);
-                if !imports.is_empty() {
-                    pending_imports.push((fid.clone(), imports, language));
-                }
-            }
-
-            // Collect supertype relationships for later INHERITS/IMPLEMENTS edges.
-            let supers = tree_sitter::extract_supertypes(rel, language, &text);
-            if !supers.is_empty() {
-                pending_supertypes.push((rel.clone(), supers));
-            }
-
-            // Collect usage references for later REFERENCES edges.
-            let refs = tree_sitter::extract_references(rel, language, &text);
-            if !refs.is_empty() {
-                pending_references.push((rel.clone(), refs));
-            }
+        if let Some((imports, language)) = work.imports {
+            pending_imports.push((work.fid.clone(), imports, language));
         }
-
-        // Manifest parsing -> projects/packages/edges.
-        if rel.ends_with(".csproj") {
-            outcome.edges += index_csproj(rel, &abs, store, &central)?;
-            projects_seen += 1;
-        } else if rel.ends_with("package.json") {
-            outcome.edges += index_package_json(rel, &abs, store)?;
+        if !work.supers.is_empty() {
+            pending_supertypes.push((work.rel.clone(), work.supers));
+        }
+        if !work.references.is_empty() {
+            pending_references.push((work.rel.clone(), work.references));
+        }
+        if let Some(manifest) = work.manifest {
+            manifest_writes.push(manifest);
             projects_seen += 1;
         }
     }
 
+    // Write every file + its symbols + DECLARES edges in one transaction.
+    store.write_files_batch(&file_writes)?;
+    // Then the manifests (projects/packages + their edges), in candidate order.
+    for manifest in &manifest_writes {
+        outcome.edges += write_manifest(store, manifest)?;
+    }
     // Post-loop edge-resolution passes. These run after the per-file scan (so
     // their link targets all exist) and can be the bulk of wall-clock on large
     // repos, so each reports a phase to the progress UI — otherwise the bar
@@ -271,26 +410,34 @@ pub fn index_repo(
         outcome.edges += resolve_imports(store, &pending_imports)?;
     }
 
-    // Resolve supertype relationships -> INHERITS/IMPLEMENTS edges. Done after
-    // the main loop so all symbols (the link targets) exist.
-    if !pending_supertypes.is_empty() {
-        report_phase(
-            "resolving type relationships",
-            outcome.files_indexed,
-            outcome.symbols,
-        );
-        outcome.edges += resolve_supertypes(store, &pending_supertypes)?;
-    }
+    // Resolve supertype/reference relationships -> INHERITS/IMPLEMENTS/REFERENCES
+    // edges. Both passes look symbols up by name and file; rather than issuing
+    // one unindexed `symbols_matching` scan per lookup (the resolve-phase
+    // bottleneck on large repos), build one in-memory index from a single full
+    // scan and resolve against it. Done after the main loop so every symbol
+    // (the link targets) exists. Skip building it when there's nothing to
+    // resolve.
+    if !pending_supertypes.is_empty() || !pending_references.is_empty() {
+        let symbol_index = SymbolIndex::build(store)?;
 
-    // Resolve usage references -> REFERENCES edges. Done after the main loop so
-    // all declarations (the link targets) exist — references are cross-file.
-    if !pending_references.is_empty() {
-        report_phase(
-            "resolving references",
-            outcome.files_indexed,
-            outcome.symbols,
-        );
-        outcome.edges += resolve_references(store, &pending_references)?;
+        if !pending_supertypes.is_empty() {
+            report_phase(
+                "resolving type relationships",
+                outcome.files_indexed,
+                outcome.symbols,
+            );
+            outcome.edges += resolve_supertypes(store, &symbol_index, &pending_supertypes)?;
+        }
+
+        // References are cross-file, so all declarations must already exist.
+        if !pending_references.is_empty() {
+            report_phase(
+                "resolving references",
+                outcome.files_indexed,
+                outcome.symbols,
+            );
+            outcome.edges += resolve_references(store, &symbol_index, &pending_references)?;
+        }
     }
 
     // Associate every indexed file with its nearest owning project manifest,
@@ -379,6 +526,87 @@ fn resolve_imports(
     Ok(edges)
 }
 
+/// In-memory index over every symbol in the graph, built once from a single
+/// full scan so the resolve passes can look symbols up by name/file in O(1)
+/// instead of issuing one unindexed `symbols_matching` scan per lookup.
+///
+/// Buckets are sorted deterministically on build (by `start_line`, `end_line`,
+/// `id`) so `from`/`child` selection — which takes the first element — is
+/// stable when a file declares several same-named symbols (overloads, etc.).
+struct SymbolIndex {
+    /// All symbols sharing a case-insensitive name, keyed by lowercased name.
+    by_name_ci: std::collections::HashMap<String, Vec<crate::graph::model::IndexedSymbol>>,
+    /// Declarations per file, keyed by file path then exact symbol name.
+    by_file: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, Vec<crate::graph::model::IndexedSymbol>>,
+    >,
+}
+
+impl SymbolIndex {
+    /// Build the index from one full-table symbol scan (empty query => no
+    /// `WHERE`, so a single pass over the Symbol table).
+    fn build(store: &dyn GraphStore) -> Result<SymbolIndex> {
+        use crate::graph::model::SymbolSearchQuery;
+        use std::collections::HashMap;
+
+        let all = store.symbols_matching(&SymbolSearchQuery::default())?;
+        let mut by_name_ci: HashMap<String, Vec<_>> = HashMap::new();
+        let mut by_file: HashMap<String, HashMap<String, Vec<_>>> = HashMap::new();
+        for sym in all {
+            by_name_ci
+                .entry(sym.name.to_ascii_lowercase())
+                .or_default()
+                .push(sym.clone());
+            by_file
+                .entry(sym.file_path.clone())
+                .or_default()
+                .entry(sym.name.clone())
+                .or_default()
+                .push(sym);
+        }
+        let sort = |list: &mut Vec<crate::graph::model::IndexedSymbol>| {
+            list.sort_by(|a, b| {
+                a.start_line
+                    .cmp(&b.start_line)
+                    .then(a.end_line.cmp(&b.end_line))
+                    .then(a.id.cmp(&b.id))
+            });
+        };
+        for list in by_name_ci.values_mut() {
+            sort(list);
+        }
+        for names in by_file.values_mut() {
+            for list in names.values_mut() {
+                sort(list);
+            }
+        }
+        Ok(SymbolIndex {
+            by_name_ci,
+            by_file,
+        })
+    }
+
+    /// The first declaration named `name` in `file` (deterministic by build
+    /// sort), or `None` if the file declares no such symbol.
+    fn decl_in_file(&self, file: &str, name: &str) -> Option<&crate::graph::model::IndexedSymbol> {
+        self.by_file.get(file)?.get(name)?.first()
+    }
+
+    /// All symbols whose name equals `name` (case-insensitive lookup, then an
+    /// exact-name filter to match the prior `name == …` post-filter semantics).
+    fn by_name<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a crate::graph::model::IndexedSymbol> + 'a {
+        self.by_name_ci
+            .get(&name.to_ascii_lowercase())
+            .into_iter()
+            .flat_map(|v| v.iter())
+            .filter(move |s| s.name == name)
+    }
+}
+
 /// Whether `candidate_path` lives in the same project directory as a file whose
 /// parent directory is `project_dir`. Segment-safe: `src` does not match
 /// `src2/foo` — the match must fall on a `/` boundary (or be the dir itself).
@@ -402,32 +630,25 @@ fn same_project_dir(candidate_path: &str, project_dir: &str) -> bool {
 ///   else INHERITS).
 fn resolve_supertypes(
     store: &dyn GraphStore,
+    index: &SymbolIndex,
     pending: &[(String, Vec<tree_sitter::Supertype>)],
 ) -> Result<usize> {
-    use crate::graph::model::{GraphEdge, SymbolKind, SymbolSearchQuery};
+    use crate::graph::model::{GraphEdge, SymbolKind};
 
     let mut batch: Vec<GraphEdge> = Vec::new();
     for (file, supers) in pending {
         let project_prefix = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         for st in supers {
             // The child symbol must be declared in this file.
-            let child_candidates = store.symbols_matching(&SymbolSearchQuery {
-                name: Some(st.child.clone()),
-                file: Some(file.clone()),
-                ..Default::default()
-            })?;
-            let Some(child) = child_candidates.into_iter().find(|s| s.name == st.child) else {
+            let Some(child) = index.decl_in_file(file, &st.child) else {
                 continue;
             };
 
             // Candidate supertype symbols (exact name match, any file).
-            let mut targets: Vec<_> = store
-                .symbols_matching(&SymbolSearchQuery {
-                    name: Some(st.supertype.clone()),
-                    ..Default::default()
-                })?
-                .into_iter()
-                .filter(|s| s.name == st.supertype && s.id != child.id)
+            let mut targets: Vec<_> = index
+                .by_name(&st.supertype)
+                .filter(|s| s.id != child.id)
+                .cloned()
                 .collect();
             if targets.is_empty() {
                 continue;
@@ -497,17 +718,10 @@ fn resolve_supertypes(
 ///   against local variables shadowing a global name.
 fn resolve_references(
     store: &dyn GraphStore,
+    index: &SymbolIndex,
     pending: &[(String, Vec<tree_sitter::Reference>)],
 ) -> Result<usize> {
-    use crate::graph::model::{IndexedSymbol, SymbolSearchQuery};
-    use std::collections::HashMap;
-
-    // Cache of target candidates keyed by referenced name, shared across every
-    // file — references to the same type recur constantly, so this turns an
-    // O(#refs) query pattern into O(#distinct names). Each entry holds the full
-    // exact-name candidate set (any file); same-file/same-project narrowing is
-    // applied per reference below.
-    let mut to_cache: HashMap<String, Vec<IndexedSymbol>> = HashMap::new();
+    use crate::graph::model::IndexedSymbol;
 
     // Accumulate edges and write them in one batch (one transaction) at the end
     // rather than one DB statement per edge — this is what removes the stall.
@@ -515,52 +729,23 @@ fn resolve_references(
     for (file, refs) in pending {
         let project_prefix = file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
 
-        // Preload every declaration in this file once, indexed by name, for the
-        // `from` (enclosing-declaration) lookup — one query per file instead of
-        // one per reference. Candidates are sorted so selection is deterministic
-        // when a file has multiple same-named declarations (overloads, etc.).
-        let mut from_by_name: HashMap<&str, Vec<&IndexedSymbol>> = HashMap::new();
-        let file_symbols = store.symbols_matching(&SymbolSearchQuery {
-            file: Some(file.clone()),
-            ..Default::default()
-        })?;
-        for sym in &file_symbols {
-            from_by_name.entry(sym.name.as_str()).or_default().push(sym);
-        }
-        for list in from_by_name.values_mut() {
-            list.sort_by(|a, b| {
-                a.start_line
-                    .cmp(&b.start_line)
-                    .then(a.end_line.cmp(&b.end_line))
-                    .then(a.id.cmp(&b.id))
-            });
-        }
-
         for r in refs {
             // The referring symbol must be a declaration in this file.
             if r.from.is_empty() {
                 continue;
             }
-            let Some(from) = from_by_name.get(r.from.as_str()).and_then(|v| v.first()) else {
+            // The `from` (enclosing-declaration) lookup: the first declaration
+            // in this file named `r.from` (deterministic by the index's build
+            // sort when a file has multiple same-named declarations).
+            let Some(from) = index.decl_in_file(file, &r.from) else {
                 continue;
             };
 
-            // Candidate target symbols (exact name match, any file), cached
-            // across files. An empty set means the name isn't a declared symbol
-            // (e.g. a local var) — no edge, the false-positive guard.
-            if !to_cache.contains_key(&r.to) {
-                let candidates = store
-                    .symbols_matching(&SymbolSearchQuery {
-                        name: Some(r.to.clone()),
-                        ..Default::default()
-                    })?
-                    .into_iter()
-                    .filter(|s| s.name == r.to)
-                    .collect();
-                to_cache.insert(r.to.clone(), candidates);
-            }
+            // Candidate target symbols (exact name match, any file). An empty
+            // set means the name isn't a declared symbol (e.g. a local var) —
+            // no edge, the false-positive guard.
             let mut targets: Vec<&IndexedSymbol> =
-                to_cache[&r.to].iter().filter(|s| s.id != from.id).collect();
+                index.by_name(&r.to).filter(|s| s.id != from.id).collect();
             if targets.is_empty() {
                 continue;
             }
@@ -751,15 +936,35 @@ fn language_enabled(config: &SynapseConfig, lang: Language) -> bool {
     }
 }
 
-/// Parse a `.csproj` and upsert the project + its references/packages.
-/// Returns the number of edges created. Package versions missing from the
-/// `.csproj` are resolved against Central Package Management via `central`.
-fn index_csproj(
+/// A manifest (`.csproj` / `package.json`) parsed into the exact, ordered set of
+/// store operations needed to record it — the project node plus its reference
+/// and package edges in document order. Produced by the pure `parse_*_manifest`
+/// functions (safe to run off the main thread) and replayed against the store
+/// by [`write_manifest`] in the sequential drain. Splitting parse from write
+/// lets the CPU-heavy parse run in parallel while keeping every store write
+/// (and thus edge ordering) on the single indexing thread.
+struct ManifestWrite {
+    project: IndexedProject,
+    ops: Vec<ManifestOp>,
+}
+
+/// One ordered store operation contributed by a manifest, after its project
+/// node is upserted. Each op corresponds to exactly one edge.
+enum ManifestOp {
+    /// `link_project_references_project(project, target_project)`.
+    ProjectRef { target: String },
+    /// `upsert_package` then `link_project_uses_package(project, package)`.
+    Package(IndexedPackage),
+}
+
+/// Parse a `.csproj` into a [`ManifestWrite`] (pure: no store access). Package
+/// versions missing from the `.csproj` are resolved against Central Package
+/// Management via `central`.
+fn parse_csproj_manifest(
     rel: &str,
     abs: &Path,
-    store: &dyn GraphStore,
     central: &CentralVersions,
-) -> Result<usize> {
+) -> Result<ManifestWrite> {
     let text =
         std::fs::read_to_string(abs).with_context(|| format!("reading {}", abs.display()))?;
     let parsed = dotnet::parse_csproj(&text)?;
@@ -776,21 +981,22 @@ fn index_csproj(
     } else {
         "dotnet"
     };
-    store.upsert_project(IndexedProject {
-        id: pid.clone(),
+    let project = IndexedProject {
+        id: pid,
         name,
         path: rel.to_string(),
         language: Language::CSharp,
         kind: kind.to_string(),
-    })?;
+    };
 
-    let mut edges = 0;
+    let mut ops = Vec::new();
     // Resolve project references relative to this csproj's directory.
     let dir = Path::new(rel).parent();
     for proj_ref in &parsed.project_references {
         let target = resolve_rel(dir, proj_ref);
-        store.link_project_references_project(&pid, &project_id(&target))?;
-        edges += 1;
+        ops.push(ManifestOp::ProjectRef {
+            target: project_id(&target),
+        });
     }
     for pkg in &parsed.package_references {
         // Prefer the inline version; fall back to the central pin (CPM).
@@ -799,23 +1005,19 @@ fn index_csproj(
             .clone()
             .or_else(|| central.version_for(rel, &pkg.name))
             .unwrap_or_default();
-        let pkg_id = package_id("nuget", &pkg.name);
-        store.upsert_package(IndexedPackage {
-            id: pkg_id.clone(),
+        ops.push(ManifestOp::Package(IndexedPackage {
+            id: package_id("nuget", &pkg.name),
             name: pkg.name.clone(),
             version,
             ecosystem: "nuget".to_string(),
             dependency_kind: "package".to_string(),
-        })?;
-        store.link_project_uses_package(&pid, &pkg_id)?;
-        edges += 1;
+        }));
     }
-    Ok(edges)
+    Ok(ManifestWrite { project, ops })
 }
 
-/// Parse a `package.json` and upsert the project + its dependencies.
-/// Returns the number of edges created.
-fn index_package_json(rel: &str, abs: &Path, store: &dyn GraphStore) -> Result<usize> {
+/// Parse a `package.json` into a [`ManifestWrite`] (pure: no store access).
+fn parse_package_json_manifest(rel: &str, abs: &Path) -> Result<ManifestWrite> {
     let text =
         std::fs::read_to_string(abs).with_context(|| format!("reading {}", abs.display()))?;
     let parsed = node::parse_package_json(&text)?;
@@ -828,29 +1030,45 @@ fn index_package_json(rel: &str, abs: &Path, store: &dyn GraphStore) -> Result<u
             .unwrap_or("package")
             .to_string()
     });
-    let pid = project_id(rel);
-    store.upsert_project(IndexedProject {
-        id: pid.clone(),
+    let project = IndexedProject {
+        id: project_id(rel),
         name,
         path: rel.to_string(),
         language: Language::JavaScript,
         kind: "node".to_string(),
-    })?;
+    };
 
-    let mut edges = 0;
+    let mut ops = Vec::new();
     for dep in &parsed.dependencies {
-        let pkg_id = package_id("npm", &dep.name);
-        store.upsert_package(IndexedPackage {
-            id: pkg_id.clone(),
+        ops.push(ManifestOp::Package(IndexedPackage {
+            id: package_id("npm", &dep.name),
             name: dep.name.clone(),
             version: dep.version.clone(),
             ecosystem: "npm".to_string(),
             dependency_kind: dep.kind.clone(),
-        })?;
-        store.link_project_uses_package(&pid, &pkg_id)?;
-        edges += 1;
+        }));
     }
-    Ok(edges)
+    Ok(ManifestWrite { project, ops })
+}
+
+/// Replay a parsed [`ManifestWrite`] against the store, in document order.
+/// Returns the number of edges created (one per op), matching the previous
+/// `index_csproj`/`index_package_json` return value exactly.
+fn write_manifest(store: &dyn GraphStore, manifest: &ManifestWrite) -> Result<usize> {
+    let pid = manifest.project.id.clone();
+    store.upsert_project(manifest.project.clone())?;
+    for op in &manifest.ops {
+        match op {
+            ManifestOp::ProjectRef { target } => {
+                store.link_project_references_project(&pid, target)?;
+            }
+            ManifestOp::Package(pkg) => {
+                store.upsert_package(pkg.clone())?;
+                store.link_project_uses_package(&pid, &pkg.id)?;
+            }
+        }
+    }
+    Ok(manifest.ops.len())
 }
 
 /// Resolve a relative manifest reference (possibly using `\`) against a base dir
