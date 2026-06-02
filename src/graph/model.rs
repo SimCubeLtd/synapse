@@ -265,6 +265,23 @@ pub enum GraphEdge {
     ProjectContainsFile { project: String, file: String },
 }
 
+/// One file's complete (re)index payload, for the batched node-write path.
+///
+/// Carries everything needed to replace a file's nodes in the graph: the file
+/// node and every symbol it declares. The indexer collects these during the
+/// drain and writes them in one transaction via
+/// [`GraphStore::write_files_batch`](crate::graph::GraphStore::write_files_batch),
+/// rather than one auto-committed statement per symbol — which is the dominant
+/// cost of indexing a large repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWrite {
+    /// The file node to upsert. Its declared symbols are removed first (clearing
+    /// stale ones from a previous index) then re-inserted from `symbols`.
+    pub file: IndexedFile,
+    /// Every symbol declared in the file, in deterministic insertion order.
+    pub symbols: Vec<IndexedSymbol>,
+}
+
 /// Aggregate counts for `status`/`index --stats`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexStats {

@@ -5,8 +5,8 @@
 //! replaceable. No backend-specific type ever appears in this signature.
 
 use crate::graph::model::{
-    FileSearchQuery, IndexStats, IndexedFile, IndexedPackage, IndexedProject, IndexedSymbol,
-    RelatedItem, SymbolSearchQuery,
+    FileSearchQuery, FileWrite, IndexStats, IndexedFile, IndexedPackage, IndexedProject,
+    IndexedSymbol, RelatedItem, SymbolSearchQuery,
 };
 use anyhow::Result;
 
@@ -63,6 +63,28 @@ pub trait GraphStore {
                 GraphEdge::ProjectContainsFile { project, file } => {
                     self.link_project_contains_file(project, file)?
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply many files' (re)index writes in one batch. For each [`FileWrite`]:
+    /// remove the file's existing nodes, upsert the file, upsert every declared
+    /// symbol, and create the `DECLARES` edges. Backends that support
+    /// transactions should write the whole batch in one transaction with reused
+    /// prepared statements — far faster than one auto-committed `upsert_symbol`
+    /// per symbol, which dominates indexing time on large repos. The default
+    /// implementation falls back to the per-file/per-symbol methods, preserving
+    /// the original ordering (remove -> upsert file -> upsert+link each symbol).
+    fn write_files_batch(&self, files: &[FileWrite]) -> Result<()> {
+        for fw in files {
+            self.remove_file(&fw.file.path)?;
+            let fid = fw.file.id.clone();
+            self.upsert_file(fw.file.clone())?;
+            for sym in &fw.symbols {
+                let sid = sym.id.clone();
+                self.upsert_symbol(sym.clone())?;
+                self.link_file_declares_symbol(&fid, &sid)?;
             }
         }
         Ok(())

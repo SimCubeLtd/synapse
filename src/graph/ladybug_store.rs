@@ -362,26 +362,31 @@ impl GraphStore for LadybugGraphStore {
         let _guard = self.lock.lock().unwrap();
         let conn = self.conn()?;
 
-        // The Cypher for each edge kind. Same MERGE shape as the per-edge
-        // `link_*` methods; here the statement is prepared ONCE per kind and
-        // re-executed per row, all inside one transaction — so we pay a single
-        // commit instead of one per edge (the source of the end-of-index stall).
+        // One `UNWIND $rows` statement per edge kind: all edges of a kind are
+        // passed as a single list-of-structs parameter and merged in one
+        // `execute`, so a 61k-edge batch is ~5 FFI calls instead of 61k. Same
+        // MERGE shape as the per-edge `link_*` methods; idempotent.
         let cypher = |e: &GraphEdge| -> &'static str {
             match e {
                 GraphEdge::SymbolReferences { .. } => {
-                    "MATCH (a:Symbol {id: $a}), (b:Symbol {id: $b}) MERGE (a)-[:REFERENCES]->(b)"
+                    "UNWIND $rows AS r MATCH (a:Symbol {id: r.a}), (b:Symbol {id: r.b}) \
+                     MERGE (a)-[:REFERENCES]->(b)"
                 }
                 GraphEdge::SymbolInherits { .. } => {
-                    "MATCH (a:Symbol {id: $a}), (b:Symbol {id: $b}) MERGE (a)-[:INHERITS]->(b)"
+                    "UNWIND $rows AS r MATCH (a:Symbol {id: r.a}), (b:Symbol {id: r.b}) \
+                     MERGE (a)-[:INHERITS]->(b)"
                 }
                 GraphEdge::SymbolImplements { .. } => {
-                    "MATCH (a:Symbol {id: $a}), (b:Symbol {id: $b}) MERGE (a)-[:IMPLEMENTS]->(b)"
+                    "UNWIND $rows AS r MATCH (a:Symbol {id: r.a}), (b:Symbol {id: r.b}) \
+                     MERGE (a)-[:IMPLEMENTS]->(b)"
                 }
                 GraphEdge::FileImportsPackage { .. } => {
-                    "MATCH (f:File {id: $a}), (k:Package {id: $b}) MERGE (f)-[:IMPORTS_PACKAGE]->(k)"
+                    "UNWIND $rows AS r MATCH (f:File {id: r.a}), (k:Package {id: r.b}) \
+                     MERGE (f)-[:IMPORTS_PACKAGE]->(k)"
                 }
                 GraphEdge::ProjectContainsFile { .. } => {
-                    "MATCH (p:Project {id: $a}), (f:File {id: $b}) MERGE (p)-[:CONTAINS_FILE]->(f)"
+                    "UNWIND $rows AS r MATCH (p:Project {id: r.a}), (f:File {id: r.b}) \
+                     MERGE (p)-[:CONTAINS_FILE]->(f)"
                 }
             }
         };
@@ -395,35 +400,48 @@ impl GraphStore for LadybugGraphStore {
                 GraphEdge::ProjectContainsFile { project, file } => (project, file),
             }
         }
+        // Discriminant index, so edges keep their kinds grouped while preserving
+        // per-kind order (the Cypher is selected from the first edge of a group).
+        fn kind_ix(e: &GraphEdge) -> u8 {
+            match e {
+                GraphEdge::SymbolReferences { .. } => 0,
+                GraphEdge::SymbolInherits { .. } => 1,
+                GraphEdge::SymbolImplements { .. } => 2,
+                GraphEdge::FileImportsPackage { .. } => 3,
+                GraphEdge::ProjectContainsFile { .. } => 4,
+            }
+        }
 
-        // One prepared statement per distinct edge-kind Cypher, reused across
-        // all rows of that kind.
-        let mut prepared: std::collections::HashMap<&'static str, lbug::PreparedStatement> =
-            std::collections::HashMap::new();
+        // Group edges by kind, preserving order within each kind.
+        let mut by_kind: std::collections::BTreeMap<u8, Vec<&GraphEdge>> =
+            std::collections::BTreeMap::new();
+        for e in edges {
+            by_kind.entry(kind_ix(e)).or_default().push(e);
+        }
 
         conn.query("BEGIN TRANSACTION")
             .map_err(|e| anyhow!("begin transaction: {e}"))?;
         // Run the batch; on any error, roll back so a partial batch isn't left
         // half-committed, then surface the error.
         let result = (|| -> Result<()> {
-            for edge in edges {
-                let q = cypher(edge);
-                if !prepared.contains_key(q) {
-                    let stmt = conn
-                        .prepare(q)
-                        .map_err(|e| anyhow!("preparing `{q}`: {e}"))?;
-                    prepared.insert(q, stmt);
-                }
-                let stmt = prepared.get_mut(q).expect("just inserted");
-                let (a, b) = endpoints(edge);
-                conn.execute(
-                    stmt,
-                    vec![
-                        ("a", Value::String(a.to_string())),
-                        ("b", Value::String(b.to_string())),
-                    ],
-                )
-                .map_err(|e| anyhow!("executing batch edge: {e}"))?;
+            for group in by_kind.values() {
+                let q = cypher(group[0]);
+                let rows: Vec<Value> = group
+                    .iter()
+                    .map(|e| {
+                        let (a, b) = endpoints(e);
+                        Value::Struct(vec![
+                            ("a".to_string(), Value::String(a.to_string())),
+                            ("b".to_string(), Value::String(b.to_string())),
+                        ])
+                    })
+                    .collect();
+                let child_ty: lbug::LogicalType = (&rows[0]).into();
+                let mut stmt = conn
+                    .prepare(q)
+                    .map_err(|e| anyhow!("preparing `{q}`: {e}"))?;
+                conn.execute(&mut stmt, vec![("rows", Value::List(child_ty, rows))])
+                    .map_err(|e| anyhow!("executing batch edges: {e}"))?;
             }
             Ok(())
         })();
@@ -440,6 +458,147 @@ impl GraphStore for LadybugGraphStore {
             },
             Err(err) => {
                 // Best-effort rollback; report the original error.
+                let _ = conn.query("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn write_files_batch(&self, files: &[crate::graph::model::FileWrite]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock.lock().unwrap();
+        let conn = self.conn()?;
+
+        // The whole batch is a handful of `UNWIND $rows` statements (one list
+        // parameter each) inside one transaction, instead of ~2 `execute` calls
+        // per symbol. Removes run first (clearing stale nodes), then file and
+        // symbol upserts, then DECLARES edges. MERGE is idempotent and all ids
+        // are deterministic, so the final graph is identical regardless of the
+        // intra-batch ordering this collapses.
+        const REMOVE_DECLARED: &str = "UNWIND $rows AS r MATCH (f:File {path: r.path})-[:DECLARES]->(s:Symbol) DETACH DELETE s";
+        const REMOVE_BY_FILEPATH: &str =
+            "UNWIND $rows AS r MATCH (s:Symbol {filePath: r.path}) DETACH DELETE s";
+        const REMOVE_FILE: &str = "UNWIND $rows AS r MATCH (f:File {path: r.path}) DETACH DELETE f";
+        const UPSERT_FILE: &str = "UNWIND $rows AS r MERGE (f:File {id: r.id}) \
+             SET f.path = r.path, f.language = r.language, f.hash = r.hash, \
+                 f.sizeBytes = r.size, f.tracked = r.tracked, f.lastIndexedAt = r.indexed";
+        const UPSERT_SYMBOL: &str = "UNWIND $rows AS r MERGE (s:Symbol {id: r.id}) \
+             SET s.name = r.name, s.fullName = r.full, s.kind = r.kind, s.language = r.language, \
+                 s.filePath = r.file, s.startLine = r.startln, s.endLine = r.endln, \
+                 s.visibility = r.vis, s.exported = r.exported";
+        const LINK_DECLARES: &str = "UNWIND $rows AS r MATCH (f:File {id: r.f}), (s:Symbol {id: r.s}) \
+             MERGE (f)-[:DECLARES]->(s)";
+
+        // Build the row lists up front (owned), so the transaction body is just
+        // a sequence of single `execute` calls.
+        let path_rows: Vec<Value> = files
+            .iter()
+            .map(|fw| {
+                Value::Struct(vec![(
+                    "path".to_string(),
+                    Value::String(fw.file.path.clone()),
+                )])
+            })
+            .collect();
+        let file_rows: Vec<Value> = files
+            .iter()
+            .map(|fw| {
+                let f = &fw.file;
+                Value::Struct(vec![
+                    ("id".to_string(), Value::String(f.id.clone())),
+                    ("path".to_string(), Value::String(f.path.clone())),
+                    (
+                        "language".to_string(),
+                        Value::String(lang_to_str(f.language)),
+                    ),
+                    ("hash".to_string(), Value::String(f.hash.clone())),
+                    ("size".to_string(), Value::Int64(f.size_bytes as i64)),
+                    ("tracked".to_string(), Value::Bool(f.tracked)),
+                    (
+                        "indexed".to_string(),
+                        Value::String(f.last_indexed_at.clone()),
+                    ),
+                ])
+            })
+            .collect();
+        let symbol_rows: Vec<Value> = files
+            .iter()
+            .flat_map(|fw| {
+                fw.symbols.iter().map(|sym| {
+                    Value::Struct(vec![
+                        ("id".to_string(), Value::String(sym.id.clone())),
+                        ("name".to_string(), Value::String(sym.name.clone())),
+                        ("full".to_string(), Value::String(sym.full_name.clone())),
+                        (
+                            "kind".to_string(),
+                            Value::String(sym.kind.as_str().to_string()),
+                        ),
+                        (
+                            "language".to_string(),
+                            Value::String(lang_to_str(sym.language)),
+                        ),
+                        ("file".to_string(), Value::String(sym.file_path.clone())),
+                        ("startln".to_string(), Value::Int64(sym.start_line as i64)),
+                        ("endln".to_string(), Value::Int64(sym.end_line as i64)),
+                        ("vis".to_string(), Value::String(sym.visibility.clone())),
+                        ("exported".to_string(), Value::Bool(sym.exported)),
+                    ])
+                })
+            })
+            .collect();
+        let declares_rows: Vec<Value> = files
+            .iter()
+            .flat_map(|fw| {
+                let fid = fw.file.id.clone();
+                fw.symbols.iter().map(move |sym| {
+                    Value::Struct(vec![
+                        ("f".to_string(), Value::String(fid.clone())),
+                        ("s".to_string(), Value::String(sym.id.clone())),
+                    ])
+                })
+            })
+            .collect();
+
+        // (cypher, rows): runs in order. Empty row lists are skipped.
+        let stages: [(&str, &Vec<Value>); 6] = [
+            (REMOVE_DECLARED, &path_rows),
+            (REMOVE_BY_FILEPATH, &path_rows),
+            (REMOVE_FILE, &path_rows),
+            (UPSERT_FILE, &file_rows),
+            (UPSERT_SYMBOL, &symbol_rows),
+            (LINK_DECLARES, &declares_rows),
+        ];
+
+        conn.query("BEGIN TRANSACTION")
+            .map_err(|e| anyhow!("begin transaction: {e}"))?;
+        let result = (|| -> Result<()> {
+            for (q, rows) in stages {
+                if rows.is_empty() {
+                    continue;
+                }
+                let child_ty: lbug::LogicalType = (&rows[0]).into();
+                let mut stmt = conn
+                    .prepare(q)
+                    .map_err(|e| anyhow!("preparing `{q}`: {e}"))?;
+                conn.execute(
+                    &mut stmt,
+                    vec![("rows", Value::List(child_ty, rows.clone()))],
+                )
+                .map_err(|e| anyhow!("executing `{q}`: {e}"))?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => match conn.query("COMMIT") {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let _ = conn.query("ROLLBACK");
+                    Err(anyhow!("commit transaction: {e}"))
+                }
+            },
+            Err(err) => {
                 let _ = conn.query("ROLLBACK");
                 Err(err)
             }
