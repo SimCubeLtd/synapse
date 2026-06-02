@@ -204,11 +204,16 @@ fn cmd_index(cwd: &Path, args: cli::IndexArgs) -> Result<()> {
             pb.set_length(p.total as u64);
             pb.set_position(p.processed as u64);
             // Bottom line: the current file during the scan, or the active
-            // post-loop phase (e.g. "resolving references…") once the per-file
-            // scan is done — so the bar at N/N shows work rather than looking
-            // hung while edges are written.
+            // post-loop phase (e.g. "resolving references 412/1559…") once the
+            // per-file scan is done — so the bar shows work rather than looking
+            // hung while the graph is written and edges resolved.
             let bottom = match p.phase {
-                Some(phase) => format!("\x1b[2m{phase}…\x1b[0m"),
+                Some(phase) => match p.phase_progress {
+                    Some((done, total)) => {
+                        format!("\x1b[2m{phase} {done}/{total}…\x1b[0m")
+                    }
+                    None => format!("\x1b[2m{phase}…\x1b[0m"),
+                },
                 None => format!("\x1b[2m{}\x1b[0m", truncate_middle(current, 64)),
             };
             pb.set_message(format!(
