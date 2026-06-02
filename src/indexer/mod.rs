@@ -200,7 +200,10 @@ fn parse_file(ctx: &ParseContext<'_>, rel: &str) -> Result<FileWork> {
     }
 
     // Manifest parsing -> projects/packages/edges (pure parse only). A parse
-    // error aborts the whole index, exactly as the previous inline `?` did.
+    // error propagates out of `parse_file`; the sequential drain surfaces it via
+    // `work?` and aborts the run *before* the batched write stage executes. This
+    // is a more atomic failure mode than the old write-as-you-go loop, which
+    // could leave earlier files already committed when a later manifest failed.
     let manifest = if rel.ends_with(".csproj") {
         Some(parse_csproj_manifest(rel, &abs, ctx.central)?)
     } else if rel.ends_with("package.json") {
@@ -321,8 +324,7 @@ pub fn index_repo(
             let parsed_count = &parsed_count;
             let done = &done;
             scope.spawn(move || {
-                loop {
-                    let n = parsed_count.load(std::sync::atomic::Ordering::Relaxed);
+                let emit = |n: usize| {
                     cb(
                         "",
                         &IndexProgress {
@@ -333,7 +335,18 @@ pub fn index_repo(
                             ..IndexProgress::default()
                         },
                     );
-                    if done.load(std::sync::atomic::Ordering::Acquire) {
+                };
+                loop {
+                    // Observe `done` first, then read the counter. `done` is
+                    // stored (Release) only after `par_iter().collect()` has
+                    // joined every worker, so all the `fetch_add(Release)`
+                    // increments happen-before it. Reading `done` via Acquire
+                    // therefore guarantees the following Acquire load sees the
+                    // final count — emit it and stop, so the last update always
+                    // reflects the true total rather than a stale lower value.
+                    let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                    emit(parsed_count.load(std::sync::atomic::Ordering::Acquire));
+                    if finished {
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(80));
@@ -344,7 +357,7 @@ pub fn index_repo(
             .par_iter()
             .map(|rel| {
                 let w = parse_file(&parse_ctx, rel);
-                parsed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                parsed_count.fetch_add(1, std::sync::atomic::Ordering::Release);
                 w
             })
             .collect();

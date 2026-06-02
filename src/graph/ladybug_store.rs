@@ -99,6 +99,21 @@ fn parse_kind(s: &str) -> SymbolKind {
     SymbolKind::from_str_opt(s).unwrap_or(SymbolKind::Function)
 }
 
+/// Execute one `UNWIND $rows`-style batch stage, moving `rows` into the list
+/// parameter so no clone is needed. An empty list is a no-op.
+fn run_stage(conn: &Connection<'_>, cypher: &str, rows: Vec<Value>) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let child_ty: lbug::LogicalType = (&rows[0]).into();
+    let mut stmt = conn
+        .prepare(cypher)
+        .map_err(|e| anyhow!("preparing `{cypher}`: {e}"))?;
+    conn.execute(&mut stmt, vec![("rows", Value::List(child_ty, rows))])
+        .map_err(|e| anyhow!("executing `{cypher}`: {e}"))?;
+    Ok(())
+}
+
 impl GraphStore for LadybugGraphStore {
     fn initialize_schema(&self) -> Result<()> {
         let _guard = self.lock.lock().unwrap();
@@ -561,33 +576,19 @@ impl GraphStore for LadybugGraphStore {
             })
             .collect();
 
-        // (cypher, rows): runs in order. Empty row lists are skipped.
-        let stages: [(&str, &Vec<Value>); 6] = [
-            (REMOVE_DECLARED, &path_rows),
-            (REMOVE_BY_FILEPATH, &path_rows),
-            (REMOVE_FILE, &path_rows),
-            (UPSERT_FILE, &file_rows),
-            (UPSERT_SYMBOL, &symbol_rows),
-            (LINK_DECLARES, &declares_rows),
-        ];
-
         conn.query("BEGIN TRANSACTION")
             .map_err(|e| anyhow!("begin transaction: {e}"))?;
         let result = (|| -> Result<()> {
-            for (q, rows) in stages {
-                if rows.is_empty() {
-                    continue;
-                }
-                let child_ty: lbug::LogicalType = (&rows[0]).into();
-                let mut stmt = conn
-                    .prepare(q)
-                    .map_err(|e| anyhow!("preparing `{q}`: {e}"))?;
-                conn.execute(
-                    &mut stmt,
-                    vec![("rows", Value::List(child_ty, rows.clone()))],
-                )
-                .map_err(|e| anyhow!("executing `{q}`: {e}"))?;
-            }
+            // Run each stage in order; empty row lists are skipped. The three
+            // `path_rows` stages share one list, so it's cloned per use (it's the
+            // small per-file list). The large per-symbol lists (`symbol_rows`,
+            // `declares_rows`) are single-use and moved in by value — no clone.
+            run_stage(&conn, REMOVE_DECLARED, path_rows.clone())?;
+            run_stage(&conn, REMOVE_BY_FILEPATH, path_rows.clone())?;
+            run_stage(&conn, REMOVE_FILE, path_rows)?;
+            run_stage(&conn, UPSERT_FILE, file_rows)?;
+            run_stage(&conn, UPSERT_SYMBOL, symbol_rows)?;
+            run_stage(&conn, LINK_DECLARES, declares_rows)?;
             Ok(())
         })();
         match result {
