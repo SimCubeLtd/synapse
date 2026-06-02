@@ -35,6 +35,12 @@ pub fn info(root: &Path) -> GitInfo {
     }
 }
 
+/// The full (40-char) commit SHA of HEAD, or `None` outside a git repo / with no
+/// commits. Used as the canonical identity for a shared graph artifact.
+pub fn full_commit(root: &Path) -> Option<String> {
+    run(root, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty())
+}
+
 /// True if `root` is inside a git work tree.
 pub fn is_git_repo(root: &Path) -> bool {
     run(root, &["rev-parse", "--is-inside-work-tree"])

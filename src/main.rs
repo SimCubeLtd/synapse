@@ -41,6 +41,14 @@ fn run() -> Result<()> {
         Command::Packages(args) => cmd_packages(&cwd, args),
         Command::Pack(args) => cmd_pack(&cwd, args),
         Command::Explore(args) => cmd_explore(&cwd, args),
+        #[cfg(feature = "share")]
+        Command::Push(args) => cmd_push(&cwd, args),
+        #[cfg(feature = "share")]
+        Command::Pull(args) => cmd_pull(&cwd, args),
+        #[cfg(not(feature = "share"))]
+        Command::Push(_) | Command::Pull(_) => anyhow::bail!(
+            "this build was compiled without the `share` feature; rebuild with `--features share` to push/pull graphs"
+        ),
         Command::Clean(args) => cmd_clean(&cwd, args),
     }
 }
@@ -98,15 +106,71 @@ fn cmd_init(cwd: &Path, args: cli::InitArgs) -> Result<()> {
     }
     config.save(&repo.root)?;
 
+    // If the repo has a root .gitignore, make sure the local graph working state
+    // is ignored — the graph is a multi-MB binary that should be shared via
+    // `synapse push`, never committed. We deliberately keep `synapse.toml`
+    // committable (it's shared team config), so we ignore the working subdirs,
+    // not the whole `.synapse/`.
+    if let Some(added) = ensure_gitignored(&repo.root, &config)? {
+        println!("Added {added} to .gitignore");
+    }
+
     println!("Initialized Synapse workspace at {}", dir.display());
     println!("  config: {}", cfg_path.display());
     println!("  graph:  {}", dir.join("graph").display());
     Ok(())
 }
 
+/// If a root `.gitignore` exists, ensure the synapse graph working state is
+/// ignored. Returns the entry added, or `None` if nothing changed (no
+/// `.gitignore`, or already covered). Only the graph/cache/packs working dirs
+/// are ignored — `synapse.toml` stays committable as shared config.
+fn ensure_gitignored(root: &Path, config: &SynapseConfig) -> Result<Option<String>> {
+    let gitignore = root.join(".gitignore");
+    if !gitignore.is_file() {
+        // Respect a repo that deliberately has no .gitignore.
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&gitignore)
+        .with_context(|| format!("reading {}", gitignore.display()))?;
+
+    // Derive the graph dir relative to the repo root (handles a custom
+    // `graph.path`); fall back to the default working subdirs of `.synapse`.
+    let graph_rel = config.graph.path.trim_end_matches('/');
+    let entry = format!("{graph_rel}/");
+
+    // Already covered? Accept the exact entry, or a broader ignore of the
+    // synapse dir / a bare graph glob.
+    let already = text.lines().map(str::trim).any(|l| {
+        l == entry
+            || l == graph_rel
+            || l == ".synapse/"
+            || l == ".synapse"
+            || l == "**/synapse.lbug"
+    });
+    if already {
+        return Ok(None);
+    }
+
+    let mut new_text = text;
+    if !new_text.is_empty() && !new_text.ends_with('\n') {
+        new_text.push('\n');
+    }
+    new_text.push_str("\n# SimCube Synapse local graph (share via `synapse push`, don't commit)\n");
+    new_text.push_str(&entry);
+    new_text.push('\n');
+    std::fs::write(&gitignore, new_text)
+        .with_context(|| format!("updating {}", gitignore.display()))?;
+    Ok(Some(entry))
+}
+
 fn cmd_index(cwd: &Path, args: cli::IndexArgs) -> Result<()> {
     let (repo, config) = require_repo(cwd)?;
     let store = open_store(&repo.root, &config)?;
+
+    // Re-indexing makes the graph locally-derived, so any registry-pull
+    // provenance marker no longer applies — remove it (best effort).
+    let _ = std::fs::remove_file(graph_origin_path(&repo.root, &config));
 
     // Count candidates for the summary (walked-and-eligible files).
     let candidates = repo.candidate_files(&config)?;
@@ -239,6 +303,18 @@ fn cmd_status(cwd: &Path, args: cli::StatusArgs) -> Result<()> {
         .unwrap_or_default();
     let ready = !indexed.is_empty();
 
+    // Provenance: if this graph was pulled from a registry, surface its origin
+    // commit and whether it matches local HEAD (staleness, even days later).
+    let origin = read_graph_origin(&repo.root, &config);
+    let origin_commit = origin
+        .as_ref()
+        .and_then(|o| o.get("commit").and_then(|c| c.as_str()))
+        .map(|s| s.to_string());
+    let origin_stale = match (&origin_commit, git::full_commit(&repo.root)) {
+        (Some(g), Some(h)) => Some(!g.starts_with(&h) && !h.starts_with(g.as_str())),
+        _ => None,
+    };
+
     if args.stale {
         for s in &stale {
             println!("{s}");
@@ -265,6 +341,8 @@ fn cmd_status(cwd: &Path, args: cli::StatusArgs) -> Result<()> {
             "branch": info.branch,
             "commit": info.commit,
             "lastIndex": last_index,
+            "origin": origin,
+            "originStale": origin_stale,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
         return Ok(());
@@ -287,7 +365,31 @@ fn cmd_status(cwd: &Path, args: cli::StatusArgs) -> Result<()> {
     if !last_index.is_empty() {
         println!("Last index: {last_index}");
     }
+    if let Some(o) = &origin {
+        let reg = o.get("registry").and_then(|v| v.as_str()).unwrap_or("?");
+        let repo_s = o.get("repository").and_then(|v| v.as_str()).unwrap_or("?");
+        let tag = o.get("tag").and_then(|v| v.as_str()).unwrap_or("?");
+        let commit = origin_commit.as_deref().unwrap_or("?");
+        println!("Origin: {reg}/{repo_s}:{tag} (commit {commit})");
+        if origin_stale == Some(true) {
+            // Loud staleness note to stderr (data stays on stdout).
+            eprintln!(
+                "warning: pulled graph was indexed at commit {commit}, but local HEAD differs; run `synapse index` to refresh"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Path to the graph provenance sidecar written by `synapse pull`.
+fn graph_origin_path(root: &Path, config: &SynapseConfig) -> std::path::PathBuf {
+    root.join(&config.graph.path).join("origin.json")
+}
+
+/// Read the provenance sidecar (`origin.json`) if present; `None` otherwise.
+fn read_graph_origin(root: &Path, config: &SynapseConfig) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(graph_origin_path(root, config)).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 fn cmd_symbols(cwd: &Path, args: cli::SymbolsArgs) -> Result<()> {
@@ -587,6 +689,198 @@ fn cmd_explore(cwd: &Path, args: cli::ExploreArgs) -> Result<()> {
     if opts.detach {
         eprintln!("Started. Open {url} — stop it with `docker ps` + `docker stop <id>`.");
     }
+    Ok(())
+}
+
+/// Resolve registry + repository from config with per-invocation overrides.
+/// Errors if neither config nor override supplies both.
+#[cfg(feature = "share")]
+fn resolve_share_coords(
+    config: &SynapseConfig,
+    registry_override: Option<String>,
+    repository_override: Option<String>,
+) -> Result<(String, String)> {
+    let registry = registry_override
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| config.share.registry.clone());
+    let repository = repository_override
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| config.share.repository.clone());
+    if registry.is_empty() || repository.is_empty() {
+        return Err(errors::SynapseError::ShareNotConfigured.into());
+    }
+    Ok((registry, repository))
+}
+
+#[cfg(feature = "share")]
+fn cmd_pull(cwd: &Path, args: cli::PullArgs) -> Result<()> {
+    use synapse::share;
+
+    let (repo, config) = require_repo(cwd)?;
+    let (registry, repository) =
+        resolve_share_coords(&config, args.registry.clone(), args.repository.clone())?;
+
+    let tag = share::resolve_pull_tag(args.tag.as_deref(), &config.share.moving_tag);
+    let target = share::ShareTarget {
+        registry,
+        repository,
+        tag,
+    };
+
+    eprintln!("Pulling graph: {}", target.display());
+    let pulled = share::pull_graph(&config.share, &target)?;
+
+    // Atomic write: temp file + rename, so an interrupted pull never leaves a
+    // half-written graph in place.
+    let graph_dir = repo.root.join(&config.graph.path);
+    std::fs::create_dir_all(&graph_dir)
+        .with_context(|| format!("creating {}", graph_dir.display()))?;
+    let final_path = graph_dir.join("synapse.lbug");
+    if final_path.exists() {
+        eprintln!(
+            "warning: overwriting existing local graph at {}",
+            final_path.display()
+        );
+    }
+    let tmp_path = graph_dir.join("synapse.lbug.tmp");
+    std::fs::write(&tmp_path, &pulled.bytes)
+        .with_context(|| format!("writing {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &final_path)
+        .with_context(|| format!("replacing {}", final_path.display()))?;
+
+    // Provenance sidecar.
+    let origin = serde_json::json!({
+        "source": "registry",
+        "registry": target.registry,
+        "repository": target.repository,
+        "tag": target.tag,
+        "commit": pulled.meta.commit,
+        "branch": pulled.meta.branch,
+        "synapseVersion": pulled.meta.synapse_version,
+        "blake3": pulled.meta.blob_blake3,
+        "pulledAt": now_rfc3339(),
+    });
+    let _ = std::fs::write(
+        graph_origin_path(&repo.root, &config),
+        serde_json::to_string_pretty(&origin).unwrap_or_default(),
+    );
+
+    // Staleness: warn loudly if the graph's commit differs from local HEAD.
+    let head_full = git::full_commit(&repo.root);
+    match share::compare_commit(pulled.meta.commit.as_deref(), head_full.as_deref()) {
+        share::GraphFreshness::Mismatch {
+            graph_commit,
+            head_commit,
+        } => {
+            eprintln!(
+                "warning: pulled graph was indexed at commit {graph_commit}, but local HEAD is {head_commit}; \
+                 symbols/edges may not reflect your working tree — run `synapse index` to refresh"
+            );
+        }
+        share::GraphFreshness::Match => {
+            eprintln!("Graph matches local HEAD commit.");
+        }
+        share::GraphFreshness::Unknown => {}
+    }
+
+    println!(
+        "Pulled {} bytes to {} (tag {})",
+        fmt_num(pulled.bytes.len()),
+        final_path.display(),
+        target.tag,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "share")]
+fn cmd_push(cwd: &Path, args: cli::PushArgs) -> Result<()> {
+    use synapse::share;
+
+    let (repo, config) = require_repo(cwd)?;
+
+    // Guard 1: push must be explicitly enabled in config.
+    if !config.share.push_enabled {
+        return Err(errors::SynapseError::PushDisabled.into());
+    }
+    // Guard 2: registry + repository configured.
+    let (registry, repository) =
+        resolve_share_coords(&config, args.registry.clone(), args.repository.clone())?;
+
+    // Guard 3: the graph must exist.
+    let graph_path = repo.root.join(&config.graph.path).join("synapse.lbug");
+    let bytes = std::fs::read(&graph_path).map_err(|_| {
+        anyhow::anyhow!(
+            "no graph at {} — run `synapse index` first",
+            graph_path.display()
+        )
+    })?;
+
+    // Guard 4: clean working tree (unless --allow-dirty), so the commit tag
+    // actually describes what's in the graph.
+    if !args.allow_dirty {
+        let changed = git::changed_files(&repo.root);
+        if !changed.is_empty() {
+            return Err(errors::SynapseError::DirtyTree(changed.len()).into());
+        }
+    }
+
+    // Guard 5: a real commit to tag by.
+    let full_commit = git::full_commit(&repo.root).ok_or_else(|| {
+        anyhow::anyhow!("cannot determine HEAD commit; not a git repo with commits")
+    })?;
+    let short_commit = git::info(&repo.root).commit;
+    let tags = share::push_tags(
+        args.tag.as_deref(),
+        short_commit.as_deref(),
+        &config.share.moving_tag,
+    );
+
+    // Guard 6: interactive type-to-confirm (unless --yes). Refuse on a
+    // non-interactive stdin rather than hang.
+    if !args.yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(errors::SynapseError::PushNotConfirmed.into());
+        }
+        eprintln!("About to push the graph to:");
+        for t in &tags {
+            eprintln!("  {registry}/{repository}:{t}");
+        }
+        eprint!("Type the repository ({repository}) to confirm: ");
+        use std::io::Write;
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading confirmation")?;
+        if line.trim() != repository {
+            return Err(errors::SynapseError::PushNotConfirmed.into());
+        }
+    }
+
+    let info = git::info(&repo.root);
+    let meta = share::GraphArtifactMeta {
+        commit: Some(full_commit),
+        branch: info.branch,
+        repo_name: if config.repo.name.is_empty() {
+            None
+        } else {
+            Some(config.repo.name.clone())
+        },
+        synapse_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        blob_blake3: Some(blake3::hash(&bytes).to_hex().to_string()),
+        created_at: Some(now_rfc3339()),
+    };
+
+    eprintln!("Pushing graph ({} bytes)…", fmt_num(bytes.len()));
+    let outcome = share::push_graph(&config.share, &registry, &repository, &tags, bytes, &meta)?;
+
+    println!(
+        "Pushed {} to {}/{} (tags: {})",
+        outcome.digest,
+        registry,
+        repository,
+        outcome.references.join(", "),
+    );
     Ok(())
 }
 

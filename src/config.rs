@@ -19,6 +19,8 @@ pub struct SynapseConfig {
     pub index: IndexConfig,
     pub graph: GraphConfig,
     pub pack: PackConfig,
+    #[serde(default)]
+    pub share: ShareConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,6 +82,59 @@ pub struct PackConfig {
     pub include_selection_reasons: bool,
 }
 
+/// Sharing the indexed graph via an OCI registry (`synapse push` / `pull`).
+///
+/// Push is OFF by default (`push_enabled = false`) — it must be explicitly
+/// enabled, and even then requires interactive confirmation and a clean tree.
+/// Credentials are never stored here: they are discovered from the existing
+/// docker login (`~/.docker/config.json` + credential helpers).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShareConfig {
+    /// Registry host[:port], e.g. "ghcr.io". Empty = sharing not configured.
+    #[serde(default)]
+    pub registry: String,
+    /// Repository path within the registry, e.g. "myorg/myrepo-synapse-graph".
+    /// Empty = sharing not configured.
+    #[serde(default)]
+    pub repository: String,
+    /// Moving tag updated on every push alongside the per-commit tag.
+    #[serde(default = "default_share_moving_tag")]
+    pub moving_tag: String,
+    /// MUST be true for `synapse push` to be permitted at all.
+    #[serde(default)]
+    pub push_enabled: bool,
+    /// Transport: "https" (default) or "http" (plaintext; dev/local only).
+    #[serde(default = "default_share_protocol")]
+    pub protocol: String,
+    /// Credential strategy: "auto" (docker creds -> env -> anonymous),
+    /// "docker", "env", or "anonymous".
+    #[serde(default = "default_share_auth")]
+    pub auth: String,
+}
+
+impl Default for ShareConfig {
+    fn default() -> Self {
+        ShareConfig {
+            registry: String::new(),
+            repository: String::new(),
+            moving_tag: default_share_moving_tag(),
+            push_enabled: false,
+            protocol: default_share_protocol(),
+            auth: default_share_auth(),
+        }
+    }
+}
+
+fn default_share_moving_tag() -> String {
+    "latest".to_string()
+}
+fn default_share_protocol() -> String {
+    "https".to_string()
+}
+fn default_share_auth() -> String {
+    "auto".to_string()
+}
+
 fn default_root() -> String {
     ".".to_string()
 }
@@ -132,6 +187,7 @@ impl Default for SynapseConfig {
                 default_format: default_format(),
                 include_selection_reasons: true,
             },
+            share: ShareConfig::default(),
         }
     }
 }

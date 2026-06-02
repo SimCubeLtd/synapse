@@ -86,6 +86,17 @@ synapse explore            # Ladybug Explorer UI on http://localhost:8000 (read-
 synapse explore --print    # just print the docker command (no Docker needed)
 ```
 
+## Share the graph via an OCI registry (optional)
+```bash
+synapse pull               # fetch the team's shared graph (tag "latest") instead of indexing
+synapse pull --tag <sha>   # fetch the graph for a specific commit
+synapse push --yes         # publish (restricted; CI skips the confirm prompt)
+```
+- Configured in the `[share]` section of synapse.toml (`registry`, `repository`, `push_enabled`).
+- Auth is auto-discovered from `docker login` (no tokens in config); anonymous for public registries; env `SYNAPSE_REGISTRY_USER`/`PASS`/`TOKEN` override for headless.
+- `pull` verifies integrity and WARNS if the graph's commit != local HEAD (it may be stale → `synapse index`). `status` shows the pulled `Origin:` commit + `originStale` in `--json`.
+- Push is gated: needs `push_enabled=true` + clean tree (or `--allow-dirty`) + confirm (or `--yes`). A fresh clone can't push by accident.
+
 ## Gotchas
 - Re-run `synapse index` after code changes; stale results otherwise (`status` shows `staleFiles`).
 - `pack` needs exactly one of `--changed/--path/--symbol/--query`.
